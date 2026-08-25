@@ -20,6 +20,7 @@ void config_set_defaults(AppConfig* cfg) {
     cfg->window_scale = 5;
     cfg->vsync = true;
     cfg->palette_idx = 0;
+    cfg->orientation_lock = 0; // 0=Auto (Sensor), 1=Landscape, 2=Portrait
 
     // [Lighting]
     cfg->flashlight_enabled = true;
@@ -118,6 +119,7 @@ bool config_load_ini(const char* file_path) {
             else if (strcmp(key, "window_scale") == 0) g_app_config.window_scale = atoi(val);
             else if (strcmp(key, "vsync") == 0) g_app_config.vsync = (atoi(val) != 0 || strcmp(val, "true") == 0);
             else if (strcmp(key, "palette_idx") == 0) g_app_config.palette_idx = atoi(val);
+            else if (strcmp(key, "orientation_lock") == 0) g_app_config.orientation_lock = atoi(val);
         } else if (strcmp(section, "Lighting") == 0) {
             if (strcmp(key, "flashlight_enabled") == 0) g_app_config.flashlight_enabled = (atoi(val) != 0 || strcmp(val, "true") == 0);
             else if (strcmp(key, "flashlight_intensity") == 0) g_app_config.flashlight_intensity = atoi(val);
@@ -192,7 +194,8 @@ bool config_save_ini(const char* file_path) {
     fprintf(f, "fullscreen=%d\n", g_app_config.fullscreen ? 1 : 0);
     fprintf(f, "window_scale=%d\n", g_app_config.window_scale);
     fprintf(f, "vsync=%d\n", g_app_config.vsync ? 1 : 0);
-    fprintf(f, "palette_idx=%d\n\n", g_app_config.palette_idx);
+    fprintf(f, "palette_idx=%d\n", g_app_config.palette_idx);
+    fprintf(f, "orientation_lock=%d\n\n", g_app_config.orientation_lock);
 
     fprintf(f, "[Lighting]\n");
     fprintf(f, "flashlight_enabled=%d\n", g_app_config.flashlight_enabled ? 1 : 0);

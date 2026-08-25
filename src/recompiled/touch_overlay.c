@@ -64,35 +64,39 @@ static uint32_t evaluate_point(float x, float y, int screen_w, int screen_h) {
     uint32_t mask = TOUCH_BTN_NONE;
     float px = x * (float)screen_w;
     float py = y * (float)screen_h;
-    float scale = (float)screen_h / 480.0f * g_touch_overlay_config.scale;
+    bool is_portrait = (screen_h > screen_w);
+
+    float base_dim = is_portrait ? (float)screen_w : (float)screen_h;
+    float scale = (base_dim / 480.0f) * g_touch_overlay_config.scale;
     if (scale < 0.6f) scale = 0.6f;
 
-    // 1. Top-Left: Show/Hide Virtual Gamepad Toggle Icon (Always active)
-    float toggle_cx = 40.0f * scale;
-    float toggle_cy = 35.0f * scale;
+    // 1. Top Icons (Show/Hide Toggle & Settings Menu)
     float icon_r = 28.0f * scale;
+    float toggle_cx = 40.0f * scale;
+    float toggle_cy = is_portrait ? (float)screen_h * 0.48f : (35.0f * scale);
     if ((px - toggle_cx) * (px - toggle_cx) + (py - toggle_cy) * (py - toggle_cy) <= icon_r * icon_r) {
         return TOUCH_BTN_TOGGLE_VISIBILITY;
     }
 
-    // 2. Top-Right: Settings Menu Access Icon (Always active)
     float menu_cx = (float)screen_w - (40.0f * scale);
-    float menu_cy = 35.0f * scale;
+    float menu_cy = is_portrait ? (float)screen_h * 0.48f : (35.0f * scale);
     if ((px - menu_cx) * (px - menu_cx) + (py - menu_cy) * (py - menu_cy) <= icon_r * icon_r) {
         return TOUCH_BTN_MENU;
     }
 
-    // If overlay is hidden or suppressed by physical controller, do not evaluate gameplay buttons
-    if (!g_touch_overlay_config.visible) {
-        return mask;
-    }
-    if (g_touch_overlay_config.auto_hide_on_controller && g_touch_overlay_config.controller_active) {
-        return mask;
-    }
+    // If overlay is hidden or auto-hidden by physical controller, do not evaluate gameplay buttons
+    if (!g_touch_overlay_config.visible) return mask;
+    if (g_touch_overlay_config.auto_hide_on_controller && g_touch_overlay_config.controller_active) return mask;
 
-    // 3. Virtual D-Pad (Bottom-Left)
-    float dpad_cx = 95.0f * scale;
-    float dpad_cy = (float)screen_h - (95.0f * scale);
+    // 2. Virtual D-Pad
+    float dpad_cx, dpad_cy;
+    if (is_portrait) {
+        dpad_cx = (float)screen_w * 0.28f;
+        dpad_cy = (float)screen_h * 0.70f;
+    } else {
+        dpad_cx = 95.0f * scale;
+        dpad_cy = (float)screen_h - (95.0f * scale);
+    }
     float dpad_radius = 85.0f * scale;
     float deadzone = 16.0f * scale;
 
@@ -101,39 +105,53 @@ static uint32_t evaluate_point(float x, float y, int screen_w, int screen_h) {
     float dist_sq = ddx * ddx + ddy * ddy;
 
     if (dist_sq <= dpad_radius * dpad_radius && dist_sq >= deadzone * deadzone) {
-        float angle = atan2f(ddy, ddx) * (180.0f / 3.14159265f); // -180 to 180 deg
+        float angle = atan2f(ddy, ddx) * (180.0f / 3.14159265f);
         if (angle >= -157.5f && angle <= -22.5f) mask |= TOUCH_BTN_UP;
         if (angle >= 22.5f && angle <= 157.5f) mask |= TOUCH_BTN_DOWN;
         if (angle >= 112.5f || angle <= -112.5f) mask |= TOUCH_BTN_LEFT;
         if (angle >= -67.5f && angle <= 67.5f) mask |= TOUCH_BTN_RIGHT;
     }
 
-    // 4. Action Button A (Bottom-Right, Upper)
-    float a_cx = (float)screen_w - (55.0f * scale);
-    float a_cy = (float)screen_h - (110.0f * scale);
+    // 3. Action Buttons A & B
+    float a_cx, a_cy, b_cx, b_cy;
     float btn_r = 38.0f * scale;
+    if (is_portrait) {
+        a_cx = (float)screen_w * 0.82f;
+        a_cy = (float)screen_h * 0.66f;
+        b_cx = (float)screen_w * 0.65f;
+        b_cy = (float)screen_h * 0.74f;
+    } else {
+        a_cx = (float)screen_w - (55.0f * scale);
+        a_cy = (float)screen_h - (110.0f * scale);
+        b_cx = (float)screen_w - (125.0f * scale);
+        b_cy = (float)screen_h - (55.0f * scale);
+    }
+
     if ((px - a_cx) * (px - a_cx) + (py - a_cy) * (py - a_cy) <= btn_r * btn_r) {
         mask |= TOUCH_BTN_A;
     }
-
-    // 5. Action Button B (Bottom-Right, Lower)
-    float b_cx = (float)screen_w - (125.0f * scale);
-    float b_cy = (float)screen_h - (55.0f * scale);
     if ((px - b_cx) * (px - b_cx) + (py - b_cy) * (py - b_cy) <= btn_r * btn_r) {
         mask |= TOUCH_BTN_B;
     }
 
-    // 6. Select Button (Bottom-Center Left)
-    float sel_cx = (float)screen_w * 0.38f;
-    float sel_cy = (float)screen_h - (30.0f * scale);
-    if (fabsf(px - sel_cx) < 38.0f * scale && fabsf(py - sel_cy) < 22.0f * scale) {
-        mask |= TOUCH_BTN_SELECT;
+    // 4. Select & Start Buttons
+    float sel_cx, sel_cy, start_cx, start_cy;
+    if (is_portrait) {
+        sel_cx = (float)screen_w * 0.38f;
+        sel_cy = (float)screen_h * 0.90f;
+        start_cx = (float)screen_w * 0.62f;
+        start_cy = (float)screen_h * 0.90f;
+    } else {
+        sel_cx = (float)screen_w * 0.38f;
+        sel_cy = (float)screen_h - (30.0f * scale);
+        start_cx = (float)screen_w * 0.62f;
+        start_cy = (float)screen_h - (30.0f * scale);
     }
 
-    // 7. Start Button (Bottom-Center Right)
-    float start_cx = (float)screen_w * 0.62f;
-    float start_cy = (float)screen_h - (30.0f * scale);
-    if (fabsf(px - start_cx) < 38.0f * scale && fabsf(py - start_cy) < 22.0f * scale) {
+    if (fabsf(px - sel_cx) < 40.0f * scale && fabsf(py - sel_cy) < 24.0f * scale) {
+        mask |= TOUCH_BTN_SELECT;
+    }
+    if (fabsf(px - start_cx) < 40.0f * scale && fabsf(py - start_cy) < 24.0f * scale) {
         mask |= TOUCH_BTN_START;
     }
 
@@ -153,7 +171,6 @@ static void update_aggregate_mask(void) {
 void touch_overlay_handle_event(const SDL_Event* event, int window_w, int window_h) {
     if (!event) return;
 
-    // Physical controller detection
     if (event->type == SDL_CONTROLLERBUTTONDOWN || event->type == SDL_CONTROLLERAXISMOTION) {
         g_touch_overlay_config.controller_active = true;
     }
@@ -173,12 +190,9 @@ void touch_overlay_handle_event(const SDL_Event* event, int window_w, int window
                 s_fingers[i].down = true;
                 s_fingers[i].active_buttons = evaluate_point(event->tfinger.x, event->tfinger.y, window_w, window_h);
 
-                // Handle Menu tap
                 if (s_fingers[i].active_buttons & TOUCH_BTN_MENU) {
                     s_menu_requested = true;
                 }
-
-                // Handle Show/Hide Gamepad Toggle tap
                 if (s_fingers[i].active_buttons & TOUCH_BTN_TOGGLE_VISIBILITY) {
                     g_touch_overlay_config.visible = !g_touch_overlay_config.visible;
                 }
@@ -238,7 +252,9 @@ static void draw_circle_outline(SDL_Renderer* renderer, int cx, int cy, int radi
 void touch_overlay_render(SDL_Renderer* renderer, int window_w, int window_h) {
     if (!g_touch_overlay_config.enabled || !renderer) return;
 
-    float scale = (float)window_h / 480.0f * g_touch_overlay_config.scale;
+    bool is_portrait = (window_h > window_w);
+    float base_dim = is_portrait ? (float)window_w : (float)window_h;
+    float scale = (base_dim / 480.0f) * g_touch_overlay_config.scale;
     if (scale < 0.6f) scale = 0.6f;
 
     uint8_t base_alpha = (uint8_t)(g_touch_overlay_config.opacity_pct * 255 / 100);
@@ -248,13 +264,12 @@ void touch_overlay_render(SDL_Renderer* renderer, int window_w, int window_h) {
     SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_BLEND);
 
     // =========================================================================
-    // 1. Top-Left: Gamepad Show/Hide Toggle Icon Button
+    // 1. Show/Hide Gamepad Toggle Icon Button
     // =========================================================================
     float toggle_cx = 40.0f * scale;
-    float toggle_cy = 35.0f * scale;
+    float toggle_cy = is_portrait ? (float)window_h * 0.48f : (35.0f * scale);
     bool toggle_act = (s_active_mask & TOUCH_BTN_TOGGLE_VISIBILITY) != 0;
 
-    // Outer circular disc
     SDL_SetRenderDrawColor(renderer, 25, 30, 40, toggle_act ? active_alpha : (icon_alpha * 3 / 4));
     draw_filled_circle(renderer, (int)toggle_cx, (int)toggle_cy, (int)(22.0f * scale));
 
@@ -264,14 +279,12 @@ void touch_overlay_render(SDL_Renderer* renderer, int window_w, int window_h) {
                                      toggle_act ? active_alpha : icon_alpha);
     draw_circle_outline(renderer, (int)toggle_cx, (int)toggle_cy, (int)(22.0f * scale), 2);
 
-    // Draw Mini-Gamepad Glyph (Rectangle + D-Pad + Buttons)
     int pad_w = (int)(18.0f * scale);
     int pad_h = (int)(11.0f * scale);
     SDL_Rect pad_rect = { (int)toggle_cx - pad_w / 2, (int)toggle_cy - pad_h / 2, pad_w, pad_h };
     SDL_SetRenderDrawColor(renderer, 220, 230, 245, toggle_act ? active_alpha : icon_alpha);
     SDL_RenderDrawRect(renderer, &pad_rect);
 
-    // If hidden, draw a slash across the gamepad icon
     if (!g_touch_overlay_config.visible) {
         SDL_SetRenderDrawColor(renderer, 255, 70, 70, toggle_act ? active_alpha : 230);
         for (int t = -1; t <= 1; t++) {
@@ -280,10 +293,10 @@ void touch_overlay_render(SDL_Renderer* renderer, int window_w, int window_h) {
     }
 
     // =========================================================================
-    // 2. Top-Right: Settings Menu Access Icon (3 Horizontal Bars / Hamburger)
+    // 2. Settings Menu Access Icon (3 Horizontal Bars)
     // =========================================================================
     float menu_cx = (float)window_w - (40.0f * scale);
-    float menu_cy = 35.0f * scale;
+    float menu_cy = is_portrait ? (float)window_h * 0.48f : (35.0f * scale);
     bool menu_act = (s_active_mask & TOUCH_BTN_MENU) != 0;
 
     SDL_SetRenderDrawColor(renderer, 25, 30, 40, menu_act ? active_alpha : (icon_alpha * 3 / 4));
@@ -292,7 +305,6 @@ void touch_overlay_render(SDL_Renderer* renderer, int window_w, int window_h) {
     SDL_SetRenderDrawColor(renderer, 200, 220, 255, menu_act ? active_alpha : icon_alpha);
     draw_circle_outline(renderer, (int)menu_cx, (int)menu_cy, (int)(22.0f * scale), 2);
 
-    // 3 Horizontal Menu Bars
     int bar_w = (int)(14.0f * scale);
     int bar_h = (int)(2.0f * scale);
     if (bar_h < 2) bar_h = 2;
@@ -306,16 +318,21 @@ void touch_overlay_render(SDL_Renderer* renderer, int window_w, int window_h) {
     SDL_RenderFillRect(renderer, &m2);
     SDL_RenderFillRect(renderer, &m3);
 
-    // If overlay is hidden or auto-hidden by physical gamepad, skip rendering gameplay buttons
     if (!g_touch_overlay_config.visible) return;
     if (g_touch_overlay_config.auto_hide_on_controller && g_touch_overlay_config.controller_active) return;
     if (g_touch_overlay_config.opacity_pct <= 0) return;
 
     // =========================================================================
-    // 3. Virtual D-Pad (Bottom-Left)
+    // 3. Virtual D-Pad
     // =========================================================================
-    float dpad_cx = 95.0f * scale;
-    float dpad_cy = (float)window_h - (95.0f * scale);
+    float dpad_cx, dpad_cy;
+    if (is_portrait) {
+        dpad_cx = (float)window_w * 0.28f;
+        dpad_cy = (float)window_h * 0.70f;
+    } else {
+        dpad_cx = 95.0f * scale;
+        dpad_cy = (float)window_h - (95.0f * scale);
+    }
     float dpad_radius = 75.0f * scale;
 
     SDL_SetRenderDrawColor(renderer, 20, 24, 30, base_alpha * 2 / 3);
@@ -351,13 +368,21 @@ void touch_overlay_render(SDL_Renderer* renderer, int window_w, int window_h) {
     SDL_RenderFillRect(renderer, &r_right);
 
     // =========================================================================
-    // 4. Action Buttons (A & B - Bottom-Right)
+    // 4. Action Buttons (A & B)
     // =========================================================================
-    float a_cx = (float)window_w - (55.0f * scale);
-    float a_cy = (float)window_h - (110.0f * scale);
-    float b_cx = (float)window_w - (125.0f * scale);
-    float b_cy = (float)window_h - (55.0f * scale);
+    float a_cx, a_cy, b_cx, b_cy;
     float btn_r = 34.0f * scale;
+    if (is_portrait) {
+        a_cx = (float)window_w * 0.82f;
+        a_cy = (float)window_h * 0.66f;
+        b_cx = (float)window_w * 0.65f;
+        b_cy = (float)window_h * 0.74f;
+    } else {
+        a_cx = (float)window_w - (55.0f * scale);
+        a_cy = (float)window_h - (110.0f * scale);
+        b_cx = (float)window_w - (125.0f * scale);
+        b_cy = (float)window_h - (55.0f * scale);
+    }
 
     // Button A (Crimson Red)
     bool a_act = (s_active_mask & TOUCH_BTN_A) != 0;
@@ -374,12 +399,20 @@ void touch_overlay_render(SDL_Renderer* renderer, int window_w, int window_h) {
     draw_circle_outline(renderer, (int)b_cx, (int)b_cy, (int)btn_r, 2);
 
     // =========================================================================
-    // 5. Select & Start (Pills)
+    // 5. Select & Start Buttons
     // =========================================================================
-    float sel_cx = (float)window_w * 0.38f;
-    float sel_cy = (float)window_h - (30.0f * scale);
-    float start_cx = (float)window_w * 0.62f;
-    float start_cy = (float)window_h - (30.0f * scale);
+    float sel_cx, sel_cy, start_cx, start_cy;
+    if (is_portrait) {
+        sel_cx = (float)window_w * 0.38f;
+        sel_cy = (float)window_h * 0.90f;
+        start_cx = (float)window_w * 0.62f;
+        start_cy = (float)window_h * 0.90f;
+    } else {
+        sel_cx = (float)window_w * 0.38f;
+        sel_cy = (float)window_h - (30.0f * scale);
+        start_cx = (float)window_w * 0.62f;
+        start_cy = (float)window_h - (30.0f * scale);
+    }
     int pill_w = (int)(54.0f * scale);
     int pill_h = (int)(18.0f * scale);
 

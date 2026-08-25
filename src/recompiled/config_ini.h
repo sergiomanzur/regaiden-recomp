@@ -25,6 +25,7 @@ typedef struct {
     int window_scale;           // 1x to 8x
     bool vsync;
     int palette_idx;
+    int orientation_lock;       // 0=Auto (Sensor), 1=Lock Landscape, 2=Lock Portrait
 
     // [Lighting]
     bool flashlight_enabled;

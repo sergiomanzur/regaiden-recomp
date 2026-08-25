@@ -24,7 +24,7 @@
             android:label="@string/app_name"
             android:launchMode="singleTask"
             android:preferMinimalPostProcessing="true"
-            android:screenOrientation="sensorLandscape">
+            android:screenOrientation="fullSensor">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />

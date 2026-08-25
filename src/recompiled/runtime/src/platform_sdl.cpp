@@ -254,6 +254,7 @@ static const char* controller_menu_hint_text(void);
 static bool input_action_is_runtime(GBInputAction action);
 static int effective_speed_percent(void);
 static void update_runtime_action_state(GBContext* ctx);
+static void apply_orientation_lock(int mode);
 
 /* Joypad state - exported for gbrt.c to access */
 uint8_t g_joypad_buttons = 0xFF;  /* Active low: Start, Select, B, A */
@@ -1013,6 +1014,7 @@ static void load_runtime_preferences(void) {
     if (g_app_config.audio_device_name[0]) {
         g_audio_target_device_name = g_app_config.audio_device_name;
     }
+    apply_orientation_lock(g_app_config.orientation_lock);
 
     // Sync Lighting Config
     g_lighting_config.enabled = g_app_config.flashlight_enabled;
@@ -1889,7 +1891,24 @@ static void update_game_viewport(void) {
     g_game_viewport.w = viewport_w;
     g_game_viewport.h = viewport_h;
     g_game_viewport.x = (window_w - viewport_w) / 2;
-    g_game_viewport.y = (window_h - viewport_h) / 2;
+    if (window_h > window_w) {
+        // Portrait mode: top-align game screen so lower half is the handheld touch deck
+        g_game_viewport.y = 12;
+    } else {
+        g_game_viewport.y = (window_h - viewport_h) / 2;
+    }
+}
+
+static void apply_orientation_lock(int mode) {
+    g_app_config.orientation_lock = mode;
+    const char* hint_value = "LandscapeLeft LandscapeRight Portrait PortraitUpsideDown";
+    if (mode == 1) {
+        hint_value = "LandscapeLeft LandscapeRight";
+    } else if (mode == 2) {
+        hint_value = "Portrait PortraitUpsideDown";
+    }
+    SDL_SetHint(SDL_HINT_ORIENTATIONS, hint_value);
+    config_save_ini(NULL);
 }
 
 static void apply_window_scale_preset(void) {
@@ -2446,6 +2465,15 @@ static void render_frame_internal(const uint32_t* framebuffer, bool count_guest_
                     config_save_ini(NULL);
                 }
                 ImGui::TextWrapped("True Widescreen expands the top-down exploration viewport from 160 to 256 pixels, eliminating camera crunch and allowing you to see enemies down ship corridors without stretching.");
+                const char* orientation_modes[] = {
+                    "Auto (Sensor / Dynamic)",
+                    "Lock to Landscape",
+                    "Lock to Portrait"
+                };
+                int current_orient = g_app_config.orientation_lock;
+                if (ImGui::Combo("Screen Orientation", &current_orient, orientation_modes, IM_ARRAYSIZE(orientation_modes))) {
+                    apply_orientation_lock(current_orient);
+                }
                 ImGui::Separator();
 
                 bool fullscreen = g_fullscreen;
