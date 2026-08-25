@@ -1,0 +1,36 @@
+# Build artifacts
+build/
+bin/*.exe
+bin/*.pdb
+bin/*.ilk
+bin/*.exp
+bin/*.lib
+*.obj
+*.o
+*.lib
+*.a
+*.pdb
+*.ilk
+*.exp
+.ninja_log
+.ninja_deps
+
+# Copyrighted ROMs and game dumps
+rom/
+*.gbc
+*.gb
+*.rom
+*.sav
+src/recompiled/Resident_Evil_Gaiden__USA__rom.c
+
+# IDE and temporary files
+.vs/
+.vscode/
+.idea/
+imgui.ini
+*.tmp
+*.log
+.system_generated/
+release/
+src/recompiled/*metadata.json
+*.json

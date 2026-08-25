@@ -1,0 +1,4395 @@
+/**
+ * @file platform_sdl.cpp
+ * @brief SDL2 platform implementation for GameBoy runtime with ImGui
+ */
+
+#include "platform_sdl.h"
+#include "gbrt.h"   /* For GBPlatformCallbacks */
+#include "gbrt_port.h"
+#include "ppu.h"
+#include "audio_stats.h"
+#include "gbrt_debug.h"
+
+#ifdef GB_HAS_SDL2
+#include <SDL.h>
+#include <atomic>
+#include <cerrno>
+#include <cctype>
+#include <cstdio>
+#include <cstring>
+#include <filesystem>
+#include <string>
+#if defined(_WIN32)
+#include <io.h>
+#include <windows.h>
+#else
+#include <fcntl.h>
+#include <unistd.h>
+#endif
+#ifdef GBRT_ENABLE_TEST_HOOKS
+#include <thread>
+#endif
+#include <vector>
+#include "imgui.h"
+#include "backends/imgui_impl_sdl2.h"
+#include "backends/imgui_impl_sdlrenderer2.h"
+#include "config_ini.h"
+#include "cheats.h"
+#include "widescreen_ppu.h"
+#include "rom_loader.h"
+#include "lighting.h"
+#include "postprocess.h"
+#include "hd_pack.h"
+
+namespace fs = std::filesystem;
+
+/* ============================================================================
+ * SDL State
+ * ========================================================================== */
+
+static SDL_Window* g_window = NULL;
+static SDL_Renderer* g_renderer = NULL;
+static SDL_Texture* g_texture = NULL;
+static int g_texture_width = GB_SCREEN_WIDTH;
+static int g_texture_height = GB_SCREEN_HEIGHT;
+static int g_scale = 5;
+static int g_windowed_width = GB_SCREEN_WIDTH * 5;
+static int g_windowed_height = GB_SCREEN_HEIGHT * 5;
+static SDL_Rect g_game_viewport = {0, 0, GB_SCREEN_WIDTH * 5, GB_SCREEN_HEIGHT * 5};
+static uint32_t g_last_frame_time = 0;
+static SDL_AudioDeviceID g_audio_device = 0;
+static SDL_GameController* g_controller = NULL;
+static bool g_vsync = false;  /* VSync OFF - we pace with wall clock for 59.7 FPS */
+static bool g_audio_started = false;
+static uint32_t g_audio_start_threshold = 0;
+
+/* Performance timing diagnostics */
+static double g_timing_render_total = 0.0;
+static double g_timing_vsync_total = 0.0;
+static uint32_t g_timing_frame_count = 0;
+static GBPlatformTimingInfo g_last_timing = {};
+
+/* Menu State */
+static bool g_show_menu = false;
+static bool g_show_overlay = false;
+static int g_speed_percent = 100;
+static int g_palette_idx = 0;
+static bool g_smooth_lcd_transitions = true;
+static bool g_launcher_return_enabled = false;
+static bool g_benchmark_mode = false;
+static std::string g_persistence_dir;
+static GBPersistenceTestFault g_persistence_test_fault =
+    GB_PERSISTENCE_TEST_FAULT_NONE;
+static GBPersistenceTestTarget g_persistence_test_target =
+    GB_PERSISTENCE_TEST_TARGET_BATTERY;
+static bool g_fullscreen = false;
+static bool g_app_suspended = false;
+static bool g_renderer_reset_pending = false;
+static GBPlatformExitAction g_exit_action = GB_PLATFORM_EXIT_QUIT;
+static const char* g_palette_names[] = { "Original (Green)", "Black & White (Pocket)", "Amber (Plasma)" };
+static const char* g_scale_names[] = { "1x (160x144)", "2x (320x288)", "3x (480x432)", "4x (640x576)", "5x (800x720)", "6x (960x864)", "7x (1120x1008)", "8x (1280x1152)" };
+typedef enum GBRenderScalingMode {
+    GB_RENDER_SCALING_PIXEL_PERFECT = 0,
+    GB_RENDER_SCALING_ASPECT_FIT = 1,
+    GB_RENDER_SCALING_ASPECT_FILL = 2,
+    GB_RENDER_SCALING_STRETCH = 3,
+} GBRenderScalingMode;
+typedef enum GBRenderFilterMode {
+    GB_RENDER_FILTER_NEAREST = 0,
+    GB_RENDER_FILTER_LINEAR = 1,
+} GBRenderFilterMode;
+typedef enum GBControllerLabelProfile {
+    GB_CONTROLLER_LABEL_GENERIC = 0,
+    GB_CONTROLLER_LABEL_XBOX = 1,
+    GB_CONTROLLER_LABEL_PLAYSTATION = 2,
+    GB_CONTROLLER_LABEL_NINTENDO = 3,
+} GBControllerLabelProfile;
+typedef enum GBInputAction {
+    GB_INPUT_ACTION_RIGHT = 0,
+    GB_INPUT_ACTION_LEFT = 1,
+    GB_INPUT_ACTION_UP = 2,
+    GB_INPUT_ACTION_DOWN = 3,
+    GB_INPUT_ACTION_A = 4,
+    GB_INPUT_ACTION_B = 5,
+    GB_INPUT_ACTION_SELECT = 6,
+    GB_INPUT_ACTION_START = 7,
+    GB_INPUT_ACTION_FAST_FORWARD = 8,
+    GB_INPUT_ACTION_TOGGLE_MAX_SPEED = 9,
+    GB_INPUT_ACTION_SAVE_STATE = 10,
+    GB_INPUT_ACTION_LOAD_STATE = 11,
+    GB_INPUT_ACTION_PREVIOUS_STATE_SLOT = 12,
+    GB_INPUT_ACTION_NEXT_STATE_SLOT = 13,
+    GB_INPUT_ACTION_TOGGLE_OVERLAY = 14,
+    GB_INPUT_ACTION_TOGGLE_MUTE = 15,
+    GB_INPUT_ACTION_TOGGLE_MENU = 16,
+    GB_INPUT_ACTION_TOGGLE_PORT_UI = 17,
+    GB_INPUT_ACTION_COUNT = 18,
+} GBInputAction;
+typedef enum GBInputBindingKind {
+    GB_INPUT_BINDING_NONE = 0,
+    GB_INPUT_BINDING_KEY = 1,
+    GB_INPUT_BINDING_CONTROLLER_BUTTON = 2,
+    GB_INPUT_BINDING_CONTROLLER_AXIS_POSITIVE = 3,
+    GB_INPUT_BINDING_CONTROLLER_AXIS_NEGATIVE = 4,
+} GBInputBindingKind;
+typedef enum GBBindingCaptureDevice {
+    GB_CAPTURE_DEVICE_NONE = 0,
+    GB_CAPTURE_DEVICE_KEYBOARD = 1,
+    GB_CAPTURE_DEVICE_CONTROLLER = 2,
+} GBBindingCaptureDevice;
+typedef struct GBInputBinding {
+    GBInputBindingKind kind;
+    int16_t code;
+} GBInputBinding;
+static GBRenderScalingMode g_render_scaling_mode = GB_RENDER_SCALING_PIXEL_PERFECT;
+static GBRenderFilterMode g_render_filter_mode = GB_RENDER_FILTER_NEAREST;
+static SDL_GameControllerType g_controller_type = SDL_CONTROLLER_TYPE_UNKNOWN;
+static GBControllerLabelProfile g_controller_label_profile = GB_CONTROLLER_LABEL_GENERIC;
+static std::string g_controller_name;
+static bool g_audio_output_enabled = true;
+static std::atomic<bool> g_audio_muted{false};
+static uint32_t g_audio_latency_ms = 80;
+static std::atomic<uint32_t> g_audio_volume_percent{100};
+static uint32_t g_audio_low_watermark = 0;
+static uint32_t g_audio_device_sample_rate = 44100;
+static uint32_t g_audio_device_buffer_samples = 0;
+static std::vector<std::string> g_audio_output_devices;
+static std::string g_audio_target_device_name;
+static std::string g_audio_active_device_name;
+static constexpr int GB_SAVESTATE_SLOT_COUNT = 10;
+static constexpr int GB_JOYPAD_ACTION_COUNT = 8;
+static constexpr int GB_FAST_FORWARD_SPEED_PERCENT = 250;
+static constexpr int GB_MAX_SHORTCUT_SPEED_PERCENT = 500;
+static int g_savestate_slot = 0;
+static std::string g_savestate_status;
+static const char* g_render_scaling_mode_names[] = {
+    "Pixel Perfect",
+    "Aspect Fit",
+    "Aspect Fill",
+    "Stretch",
+};
+static const char* g_render_filter_names[] = {
+    "Nearest",
+    "Linear",
+};
+static const uint32_t g_palettes[][4] = {
+    { 0xFFE0F8D0, 0xFF88C070, 0xFF346856, 0xFF081820 }, // Original
+    { 0xFFFFFFFF, 0xFFAAAAAA, 0xFF555555, 0xFF000000 }, // B&W
+    { 0xFFFFB000, 0xFFCB4F0E, 0xFF800000, 0xFF330000 }  // Amber
+};
+static uint32_t g_lcd_off_framebuffer[GB_FRAMEBUFFER_SIZE];
+static uint32_t g_last_guest_framebuffer[GB_FRAMEBUFFER_SIZE];
+static bool g_lcd_off_framebuffer_initialized = false;
+static bool g_last_guest_framebuffer_valid = false;
+static uint64_t g_present_count = 0;
+static GBContext* g_registered_ctx = NULL;
+static GBPortFrame g_port_frame = {};
+static bool g_port_frame_valid = false;
+static GBInputBinding g_keyboard_bindings[GB_INPUT_ACTION_COUNT][2] = {};
+static GBInputBinding g_controller_bindings[GB_INPUT_ACTION_COUNT][2] = {};
+static bool g_keyboard_binding_pressed[GB_INPUT_ACTION_COUNT][2] = {};
+static bool g_controller_button_binding_pressed[GB_INPUT_ACTION_COUNT][2] = {};
+static bool g_controller_axis_binding_pressed[GB_INPUT_ACTION_COUNT][2] = {};
+static bool g_runtime_action_pressed[GB_INPUT_ACTION_COUNT] = {};
+static Sint16 g_controller_axis_values[SDL_CONTROLLER_AXIS_MAX] = {};
+static bool g_binding_capture_active = false;
+static GBBindingCaptureDevice g_binding_capture_device = GB_CAPTURE_DEVICE_NONE;
+static GBInputAction g_binding_capture_action = GB_INPUT_ACTION_RIGHT;
+static int g_binding_capture_slot = 0;
+static bool g_fast_forward_active = false;
+static bool g_max_speed_mode = false;
+static const char* g_input_action_names[GB_INPUT_ACTION_COUNT] = {
+    "Right",
+    "Left",
+    "Up",
+    "Down",
+    "Game Boy A",
+    "Game Boy B",
+    "Select",
+    "Start",
+    "Fast Forward (Hold)",
+    "Toggle Max Speed",
+    "Save State",
+    "Load State",
+    "Previous State Slot",
+    "Next State Slot",
+    "Toggle Overlay",
+    "Toggle Mute",
+    "Toggle Menu",
+    "Toggle Game Panel",
+};
+
+static bool has_interpreter_activity(const GBContext* ctx) {
+    return ctx != NULL &&
+           (ctx->total_dispatch_fallbacks > 0 ||
+            ctx->total_interpreter_entries > 0 ||
+            ctx->has_unimplemented_interpreter_opcode);
+}
+
+static void update_audio_stats_from_ring(void);
+static uint32_t current_audio_underruns(void);
+static uint32_t current_audio_ring_fill_samples(void);
+static uint32_t current_audio_ring_capacity(void);
+static uint32_t audio_ring_fill_samples(void);
+static void sdl_audio_callback(void* userdata, Uint8* stream, int len);
+static void refresh_audio_output_devices(void);
+static const char* current_audio_output_device_label(void);
+static bool current_audio_output_device_available(void);
+static void close_audio_output_device(void);
+static bool reopen_audio_output_device(bool preserve_stats);
+static void update_controller_axis_binding_state(void);
+static void recompute_audio_targets(void);
+static void refresh_audio_device_pause_state(void);
+static void reset_audio_output_buffer(bool preserve_stats);
+static char* trim_ascii(char* text);
+static void update_effective_joypad_state(void);
+static void save_runtime_preferences(void);
+static bool save_savestate_slot(GBContext* ctx, int slot);
+static bool load_savestate_slot(GBContext* ctx, int slot);
+static bool delete_savestate_slot(GBContext* ctx, int slot);
+static bool savestate_slot_exists(const GBContext* ctx, int slot, std::string* out_path);
+static float settings_ui_scale_for_size(const ImVec2& display_size);
+static const char* controller_menu_hint_text(void);
+static bool input_action_is_runtime(GBInputAction action);
+static int effective_speed_percent(void);
+static void update_runtime_action_state(GBContext* ctx);
+
+/* Joypad state - exported for gbrt.c to access */
+uint8_t g_joypad_buttons = 0xFF;  /* Active low: Start, Select, B, A */
+uint8_t g_joypad_dpad = 0xFF;     /* Active low: Down, Up, Left, Right */
+static uint8_t g_manual_joypad_buttons = 0xFF;
+static uint8_t g_manual_joypad_dpad = 0xFF;
+static uint8_t g_script_joypad_buttons = 0xFF;
+static uint8_t g_script_joypad_dpad = 0xFF;
+
+/* ============================================================================
+ * Automation State
+ * ========================================================================== */
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <ctype.h>
+
+#define MAX_SCRIPT_ENTRIES 2048
+typedef enum {
+    SCRIPT_ANCHOR_FRAME = 0,
+    SCRIPT_ANCHOR_CYCLE = 1,
+} ScriptAnchor;
+
+typedef struct {
+    ScriptAnchor anchor;
+    uint64_t start;
+    uint64_t end;
+    uint64_t period;
+    uint64_t duration;
+    uint8_t dpad;    /* Active LOW mask to apply (0 = Pressed) */
+    uint8_t buttons; /* Active LOW mask to apply (0 = Pressed) */
+} ScriptEntry;
+
+static ScriptEntry g_input_script[MAX_SCRIPT_ENTRIES];
+static int g_script_count = 0;
+static FILE* g_input_record_file = NULL;
+static bool g_input_record_exit_handler_registered = false;
+static bool g_input_record_wrote_entry = false;
+static bool g_input_record_has_segment = false;
+static uint64_t g_input_record_start_cycle = 0;
+static uint64_t g_input_record_end_cycle = 0;
+static uint8_t g_input_record_dpad = 0xFF;
+static uint8_t g_input_record_buttons = 0xFF;
+
+#define MAX_DUMP_FRAMES 100
+static uint32_t g_dump_frames[MAX_DUMP_FRAMES];
+static int g_dump_count = 0;
+static uint32_t g_dump_present_frames[MAX_DUMP_FRAMES];
+static int g_dump_present_count = 0;
+static std::string g_screenshot_prefix = "screenshot";
+
+static bool env_flag_enabled(const char* name) {
+    const char* value = SDL_getenv(name);
+    if (!value || !value[0]) {
+        return false;
+    }
+    return strcmp(value, "1") == 0 ||
+           strcmp(value, "true") == 0 ||
+           strcmp(value, "TRUE") == 0 ||
+           strcmp(value, "yes") == 0 ||
+           strcmp(value, "YES") == 0 ||
+           strcmp(value, "on") == 0 ||
+           strcmp(value, "ON") == 0;
+}
+
+static bool platform_default_fullscreen(void) {
+#if defined(__ANDROID__)
+    return true;
+#else
+    return false;
+#endif
+}
+
+static bool platform_uses_app_storage_for_relative_paths(void) {
+#if defined(__ANDROID__)
+    return true;
+#else
+    return false;
+#endif
+}
+
+static const char* overlay_menu_hint_text(void) {
+#if defined(__ANDROID__)
+    return "Press Back, L3, or R3 for Menu";
+#else
+    return "Press ESC for Menu";
+#endif
+}
+
+static float settings_ui_scale_for_size(const ImVec2& display_size) {
+    float min_dimension = display_size.x < display_size.y ? display_size.x : display_size.y;
+    if (min_dimension <= 0.0f) {
+        return 1.0f;
+    }
+
+#if defined(__ANDROID__)
+    float scale = min_dimension / 520.0f;
+    if (scale < 1.0f) scale = 1.0f;
+    if (scale > 1.65f) scale = 1.65f;
+#else
+    float scale = min_dimension / 720.0f;
+    if (scale < 0.95f) scale = 0.95f;
+    if (scale > 1.25f) scale = 1.25f;
+#endif
+
+    return scale;
+}
+
+static const char* controller_menu_hint_text(void) {
+#if defined(__ANDROID__)
+    return "Guide, L3, or R3: Settings Menu";
+#else
+    return "Guide / Home: Settings Menu";
+#endif
+}
+
+static bool input_action_is_runtime(GBInputAction action) {
+    return action >= GB_JOYPAD_ACTION_COUNT && action < GB_INPUT_ACTION_COUNT;
+}
+
+static int effective_speed_percent(void) {
+    int speed_percent = (g_speed_percent > 0) ? g_speed_percent : 100;
+    if (g_max_speed_mode) {
+        return GB_MAX_SHORTCUT_SPEED_PERCENT;
+    }
+    if (g_fast_forward_active && speed_percent < GB_FAST_FORWARD_SPEED_PERCENT) {
+        return GB_FAST_FORWARD_SPEED_PERCENT;
+    }
+    return speed_percent;
+}
+
+static const char* overlay_visibility_hint_text(void) {
+#if defined(__ANDROID__)
+    return "Use the settings menu or a shortcut binding to toggle the overlay";
+#else
+    return "Use F1 or a shortcut binding for Overlay";
+#endif
+}
+
+static bool string_contains_case_insensitive(const char* haystack, const char* needle) {
+    if (!haystack || !needle || !haystack[0] || !needle[0]) {
+        return false;
+    }
+
+    std::string text(haystack);
+    std::string pattern(needle);
+    for (char& ch : text) ch = (char)std::tolower((unsigned char)ch);
+    for (char& ch : pattern) ch = (char)std::tolower((unsigned char)ch);
+    return text.find(pattern) != std::string::npos;
+}
+
+static bool should_ignore_controller_name(const char* name) {
+    return string_contains_case_insensitive(name, "qwerty") ||
+           string_contains_case_insensitive(name, "keyboard") ||
+           string_contains_case_insensitive(name, "keypad");
+}
+
+static const char* controller_type_name(SDL_GameControllerType type) {
+    switch (type) {
+        case SDL_CONTROLLER_TYPE_XBOX360: return "Xbox 360";
+        case SDL_CONTROLLER_TYPE_XBOXONE: return "Xbox One";
+        case SDL_CONTROLLER_TYPE_PS3: return "PlayStation 3";
+        case SDL_CONTROLLER_TYPE_PS4: return "PlayStation 4";
+        case SDL_CONTROLLER_TYPE_PS5: return "PlayStation 5";
+        case SDL_CONTROLLER_TYPE_NINTENDO_SWITCH_PRO: return "Nintendo Switch Pro";
+        case SDL_CONTROLLER_TYPE_NINTENDO_SWITCH_JOYCON_LEFT: return "Joy-Con Left";
+        case SDL_CONTROLLER_TYPE_NINTENDO_SWITCH_JOYCON_RIGHT: return "Joy-Con Right";
+        case SDL_CONTROLLER_TYPE_NINTENDO_SWITCH_JOYCON_PAIR: return "Joy-Con Pair";
+        case SDL_CONTROLLER_TYPE_GOOGLE_STADIA: return "Stadia";
+        case SDL_CONTROLLER_TYPE_AMAZON_LUNA: return "Luna";
+        case SDL_CONTROLLER_TYPE_NVIDIA_SHIELD: return "NVIDIA Shield";
+        case SDL_CONTROLLER_TYPE_VIRTUAL: return "Virtual";
+        case SDL_CONTROLLER_TYPE_UNKNOWN:
+        default:
+            return "Unknown";
+    }
+}
+
+static GBControllerLabelProfile detect_controller_label_profile(SDL_GameController* controller) {
+    if (controller) {
+        const SDL_GameControllerType type = SDL_GameControllerGetType(controller);
+        switch (type) {
+            case SDL_CONTROLLER_TYPE_XBOX360:
+            case SDL_CONTROLLER_TYPE_XBOXONE:
+            case SDL_CONTROLLER_TYPE_GOOGLE_STADIA:
+            case SDL_CONTROLLER_TYPE_AMAZON_LUNA:
+            case SDL_CONTROLLER_TYPE_NVIDIA_SHIELD:
+                return GB_CONTROLLER_LABEL_XBOX;
+
+            case SDL_CONTROLLER_TYPE_PS3:
+            case SDL_CONTROLLER_TYPE_PS4:
+            case SDL_CONTROLLER_TYPE_PS5:
+                return GB_CONTROLLER_LABEL_PLAYSTATION;
+
+            case SDL_CONTROLLER_TYPE_NINTENDO_SWITCH_PRO:
+            case SDL_CONTROLLER_TYPE_NINTENDO_SWITCH_JOYCON_LEFT:
+            case SDL_CONTROLLER_TYPE_NINTENDO_SWITCH_JOYCON_RIGHT:
+            case SDL_CONTROLLER_TYPE_NINTENDO_SWITCH_JOYCON_PAIR:
+                return GB_CONTROLLER_LABEL_NINTENDO;
+
+            default:
+                break;
+        }
+
+        const char* name = SDL_GameControllerName(controller);
+        if (string_contains_case_insensitive(name, "xbox") ||
+            string_contains_case_insensitive(name, "xinput") ||
+            string_contains_case_insensitive(name, "stadia") ||
+            string_contains_case_insensitive(name, "luna") ||
+            string_contains_case_insensitive(name, "shield") ||
+            string_contains_case_insensitive(name, "kishi") ||
+            string_contains_case_insensitive(name, "odin") ||
+            string_contains_case_insensitive(name, "retroid")) {
+            return GB_CONTROLLER_LABEL_XBOX;
+        }
+        if (string_contains_case_insensitive(name, "playstation") ||
+            string_contains_case_insensitive(name, "dualshock") ||
+            string_contains_case_insensitive(name, "dualsense") ||
+            string_contains_case_insensitive(name, "ps3") ||
+            string_contains_case_insensitive(name, "ps4") ||
+            string_contains_case_insensitive(name, "ps5")) {
+            return GB_CONTROLLER_LABEL_PLAYSTATION;
+        }
+        if (string_contains_case_insensitive(name, "switch") ||
+            string_contains_case_insensitive(name, "joy-con") ||
+            string_contains_case_insensitive(name, "joycon") ||
+            string_contains_case_insensitive(name, "nintendo")) {
+            return GB_CONTROLLER_LABEL_NINTENDO;
+        }
+    }
+
+#if defined(__ANDROID__)
+    return GB_CONTROLLER_LABEL_XBOX;
+#else
+    return GB_CONTROLLER_LABEL_GENERIC;
+#endif
+}
+
+static const char* controller_face_south_label(void) {
+    switch (g_controller_label_profile) {
+        case GB_CONTROLLER_LABEL_XBOX: return "A (Bottom)";
+        case GB_CONTROLLER_LABEL_PLAYSTATION: return "Cross (Bottom)";
+        case GB_CONTROLLER_LABEL_NINTENDO: return "B (Bottom)";
+        case GB_CONTROLLER_LABEL_GENERIC:
+        default:
+            return "South / Bottom";
+    }
+}
+
+static const char* controller_face_east_label(void) {
+    switch (g_controller_label_profile) {
+        case GB_CONTROLLER_LABEL_XBOX: return "B (Right)";
+        case GB_CONTROLLER_LABEL_PLAYSTATION: return "Circle (Right)";
+        case GB_CONTROLLER_LABEL_NINTENDO: return "A (Right)";
+        case GB_CONTROLLER_LABEL_GENERIC:
+        default:
+            return "East / Right";
+    }
+}
+
+static const char* controller_left_shoulder_label(void) {
+    switch (g_controller_label_profile) {
+        case GB_CONTROLLER_LABEL_XBOX: return "LB";
+        case GB_CONTROLLER_LABEL_PLAYSTATION: return "L1";
+        case GB_CONTROLLER_LABEL_NINTENDO: return "L";
+        case GB_CONTROLLER_LABEL_GENERIC:
+        default:
+            return "Left Shoulder";
+    }
+}
+
+static const char* controller_right_shoulder_label(void) {
+    switch (g_controller_label_profile) {
+        case GB_CONTROLLER_LABEL_XBOX: return "RB";
+        case GB_CONTROLLER_LABEL_PLAYSTATION: return "R1";
+        case GB_CONTROLLER_LABEL_NINTENDO: return "R";
+        case GB_CONTROLLER_LABEL_GENERIC:
+        default:
+            return "Right Shoulder";
+    }
+}
+
+static const char* controller_back_label(void) {
+    switch (g_controller_label_profile) {
+        case GB_CONTROLLER_LABEL_XBOX: return "View / Back";
+        case GB_CONTROLLER_LABEL_PLAYSTATION: return "Create / Share";
+        case GB_CONTROLLER_LABEL_NINTENDO: return "-";
+        case GB_CONTROLLER_LABEL_GENERIC:
+        default:
+            return "Back / Select";
+    }
+}
+
+static const char* controller_start_label(void) {
+    switch (g_controller_label_profile) {
+        case GB_CONTROLLER_LABEL_XBOX: return "Menu / Start";
+        case GB_CONTROLLER_LABEL_PLAYSTATION: return "Options";
+        case GB_CONTROLLER_LABEL_NINTENDO: return "+";
+        case GB_CONTROLLER_LABEL_GENERIC:
+        default:
+            return "Start";
+    }
+}
+
+static const char* controller_guide_label(void) {
+    switch (g_controller_label_profile) {
+        case GB_CONTROLLER_LABEL_XBOX: return "Xbox / Guide";
+        case GB_CONTROLLER_LABEL_PLAYSTATION: return "PS";
+        case GB_CONTROLLER_LABEL_NINTENDO: return "Home";
+        case GB_CONTROLLER_LABEL_GENERIC:
+        default:
+            return "Guide / Home";
+    }
+}
+
+static const char* controller_button_label(SDL_GameControllerButton button) {
+    switch (button) {
+        case SDL_CONTROLLER_BUTTON_A: return controller_face_south_label();
+        case SDL_CONTROLLER_BUTTON_B: return controller_face_east_label();
+        case SDL_CONTROLLER_BUTTON_X: return "West Face";
+        case SDL_CONTROLLER_BUTTON_Y: return "North Face";
+        case SDL_CONTROLLER_BUTTON_BACK: return controller_back_label();
+        case SDL_CONTROLLER_BUTTON_GUIDE: return controller_guide_label();
+        case SDL_CONTROLLER_BUTTON_START: return controller_start_label();
+        case SDL_CONTROLLER_BUTTON_LEFTSHOULDER: return controller_left_shoulder_label();
+        case SDL_CONTROLLER_BUTTON_RIGHTSHOULDER: return controller_right_shoulder_label();
+        case SDL_CONTROLLER_BUTTON_DPAD_UP: return "D-Pad Up";
+        case SDL_CONTROLLER_BUTTON_DPAD_DOWN: return "D-Pad Down";
+        case SDL_CONTROLLER_BUTTON_DPAD_LEFT: return "D-Pad Left";
+        case SDL_CONTROLLER_BUTTON_DPAD_RIGHT: return "D-Pad Right";
+        case SDL_CONTROLLER_BUTTON_LEFTSTICK: return "Left Stick Click";
+        case SDL_CONTROLLER_BUTTON_RIGHTSTICK: return "Right Stick Click";
+        default:
+            return "Controller Button";
+    }
+}
+
+static const char* controller_axis_label(SDL_GameControllerAxis axis, bool positive_direction) {
+    switch (axis) {
+        case SDL_CONTROLLER_AXIS_LEFTX: return positive_direction ? "Left Stick Right" : "Left Stick Left";
+        case SDL_CONTROLLER_AXIS_LEFTY: return positive_direction ? "Left Stick Down" : "Left Stick Up";
+        case SDL_CONTROLLER_AXIS_RIGHTX: return positive_direction ? "Right Stick Right" : "Right Stick Left";
+        case SDL_CONTROLLER_AXIS_RIGHTY: return positive_direction ? "Right Stick Down" : "Right Stick Up";
+        case SDL_CONTROLLER_AXIS_TRIGGERLEFT: return "Left Trigger";
+        case SDL_CONTROLLER_AXIS_TRIGGERRIGHT: return "Right Trigger";
+        default:
+            return positive_direction ? "Axis +" : "Axis -";
+    }
+}
+
+static std::string binding_display_label(const GBInputBinding& binding) {
+    switch (binding.kind) {
+        case GB_INPUT_BINDING_KEY: {
+            const char* name = SDL_GetScancodeName((SDL_Scancode)binding.code);
+            return (name && name[0]) ? std::string(name) : ("Scancode " + std::to_string((int)binding.code));
+        }
+
+        case GB_INPUT_BINDING_CONTROLLER_BUTTON:
+            return controller_button_label((SDL_GameControllerButton)binding.code);
+
+        case GB_INPUT_BINDING_CONTROLLER_AXIS_POSITIVE:
+            return controller_axis_label((SDL_GameControllerAxis)binding.code, true);
+
+        case GB_INPUT_BINDING_CONTROLLER_AXIS_NEGATIVE:
+            return controller_axis_label((SDL_GameControllerAxis)binding.code, false);
+
+        case GB_INPUT_BINDING_NONE:
+        default:
+            return "Unbound";
+    }
+}
+
+static void start_binding_capture(GBBindingCaptureDevice device, GBInputAction action, int slot) {
+    g_binding_capture_active = true;
+    g_binding_capture_device = device;
+    g_binding_capture_action = action;
+    g_binding_capture_slot = slot;
+}
+
+static void cancel_binding_capture(void) {
+    g_binding_capture_active = false;
+    g_binding_capture_device = GB_CAPTURE_DEVICE_NONE;
+    g_binding_capture_slot = 0;
+}
+
+static void assign_binding_slot(GBBindingCaptureDevice device,
+                                GBInputAction action,
+                                int slot,
+                                const GBInputBinding& binding) {
+    if (slot < 0 || slot >= 2) {
+        return;
+    }
+
+    if (device == GB_CAPTURE_DEVICE_KEYBOARD) {
+        g_keyboard_bindings[action][slot] = binding;
+        g_keyboard_binding_pressed[action][slot] = false;
+    } else if (device == GB_CAPTURE_DEVICE_CONTROLLER) {
+        g_controller_bindings[action][slot] = binding;
+        g_controller_button_binding_pressed[action][slot] = false;
+        g_controller_axis_binding_pressed[action][slot] = false;
+        update_controller_axis_binding_state();
+    }
+
+    update_effective_joypad_state();
+    save_runtime_preferences();
+}
+
+static void commit_binding_capture(const GBInputBinding& binding) {
+    if (!g_binding_capture_active || g_binding_capture_slot < 0 || g_binding_capture_slot >= 2) {
+        cancel_binding_capture();
+        return;
+    }
+
+    assign_binding_slot(g_binding_capture_device, g_binding_capture_action, g_binding_capture_slot, binding);
+    cancel_binding_capture();
+}
+
+static void clear_controller_state(void) {
+    if (g_controller) {
+        SDL_GameControllerClose(g_controller);
+        g_controller = NULL;
+    }
+    memset(g_controller_button_binding_pressed, 0, sizeof(g_controller_button_binding_pressed));
+    memset(g_controller_axis_binding_pressed, 0, sizeof(g_controller_axis_binding_pressed));
+    memset(g_controller_axis_values, 0, sizeof(g_controller_axis_values));
+    g_controller_type = SDL_CONTROLLER_TYPE_UNKNOWN;
+    g_controller_label_profile = detect_controller_label_profile(NULL);
+    g_controller_name.clear();
+    update_effective_joypad_state();
+}
+
+static void refresh_controller_profile(void) {
+    if (!g_controller) {
+        g_controller_type = SDL_CONTROLLER_TYPE_UNKNOWN;
+        g_controller_label_profile = detect_controller_label_profile(NULL);
+        g_controller_name.clear();
+        return;
+    }
+
+    g_controller_type = SDL_GameControllerGetType(g_controller);
+    g_controller_label_profile = detect_controller_label_profile(g_controller);
+    const char* name = SDL_GameControllerName(g_controller);
+    g_controller_name = (name && name[0]) ? name : "Controller";
+    fprintf(stderr,
+            "[SDL] Controller: %s [%s]\n",
+            g_controller_name.c_str(),
+            controller_type_name(g_controller_type));
+}
+
+static bool open_controller_index(int joystick_index) {
+    if (joystick_index < 0 || joystick_index >= SDL_NumJoysticks() || !SDL_IsGameController(joystick_index)) {
+        return false;
+    }
+
+    SDL_GameController* controller = SDL_GameControllerOpen(joystick_index);
+    if (!controller) {
+        return false;
+    }
+
+    if (should_ignore_controller_name(SDL_GameControllerName(controller))) {
+        SDL_GameControllerClose(controller);
+        return false;
+    }
+
+    clear_controller_state();
+    g_controller = controller;
+    refresh_controller_profile();
+    return true;
+}
+
+static bool open_first_available_controller(void) {
+    if (g_controller) {
+        return true;
+    }
+
+    for (int i = 0; i < SDL_NumJoysticks(); i++) {
+        if (open_controller_index(i)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void install_supplemental_controller_mappings(void) {
+#if defined(__APPLE__)
+    // SDL2's built-in database does not yet cover the wired 8BitDo Ultimate
+    // 2C on macOS. Do not replace a user or future SDL mapping when one is
+    // already available.
+    for (int i = 0; i < SDL_NumJoysticks(); i++) {
+        if (SDL_IsGameController(i) ||
+            SDL_JoystickGetDeviceVendor(i) != 0x2dc8 ||
+            SDL_JoystickGetDeviceProduct(i) != 0x301d) {
+            continue;
+        }
+        SDL_GameControllerAddMapping(
+            "03000000c82d00001d30000001000000,"
+            "8BitDo Ultimate 2C Wired Controller,"
+            "a:b0,b:b1,back:b10,dpdown:h0.4,dpleft:h0.8,dpright:h0.2,"
+            "dpup:h0.1,guide:b12,leftshoulder:b6,leftstick:b13,"
+            "lefttrigger:a5,leftx:a0,lefty:a1,paddle1:b5,paddle2:b2,"
+            "rightshoulder:b7,rightstick:b14,righttrigger:a4,rightx:a2,"
+            "righty:a3,start:b11,x:b3,y:b4,platform:Mac OS X,"
+        );
+    }
+#endif
+}
+
+static SDL_JoystickID active_controller_instance_id(void) {
+    if (!g_controller) {
+        return -1;
+    }
+    SDL_Joystick* joystick = SDL_GameControllerGetJoystick(g_controller);
+    return joystick ? SDL_JoystickInstanceID(joystick) : -1;
+}
+
+static bool ensure_parent_directory(const fs::path& path) {
+    if (path.parent_path().empty()) {
+        return true;
+    }
+    std::error_code ec;
+    fs::create_directories(path.parent_path(), ec);
+    return !ec;
+}
+
+static std::string extract_path_leaf(const char* path) {
+    if (!path || !path[0]) {
+        return "game";
+    }
+    try {
+        fs::path input(path);
+        std::string leaf = input.filename().string();
+        return leaf.empty() ? std::string(path) : leaf;
+    } catch (...) {
+        return std::string(path);
+    }
+}
+
+static std::string make_pref_storage_dir(const char* app_component) {
+    const char* safe_component = (app_component && app_component[0]) ? app_component : "runtime";
+    char* pref_path = SDL_GetPrefPath("gbrecompiled", safe_component);
+    if (!pref_path) {
+        return std::string();
+    }
+    std::string result(pref_path);
+    SDL_free(pref_path);
+    return result;
+}
+
+static std::string resolve_writable_path(const char* requested_path, const char* app_component) {
+    if (!requested_path || !requested_path[0]) {
+        return std::string();
+    }
+
+    fs::path requested(requested_path);
+    if (!platform_uses_app_storage_for_relative_paths() || requested.is_absolute()) {
+        return requested.lexically_normal().string();
+    }
+
+    const std::string pref_dir = make_pref_storage_dir(app_component);
+    if (pref_dir.empty()) {
+        return requested.lexically_normal().string();
+    }
+
+    fs::path resolved = fs::path(pref_dir) / requested;
+    ensure_parent_directory(resolved);
+    return resolved.lexically_normal().string();
+}
+
+static GBInputBinding make_binding(GBInputBindingKind kind, int code) {
+    GBInputBinding binding = {};
+    binding.kind = kind;
+    binding.code = (int16_t)code;
+    return binding;
+}
+
+static const char* input_action_config_name(GBInputAction action) {
+    switch (action) {
+        case GB_INPUT_ACTION_RIGHT: return "right";
+        case GB_INPUT_ACTION_LEFT: return "left";
+        case GB_INPUT_ACTION_UP: return "up";
+        case GB_INPUT_ACTION_DOWN: return "down";
+        case GB_INPUT_ACTION_A: return "a";
+        case GB_INPUT_ACTION_B: return "b";
+        case GB_INPUT_ACTION_SELECT: return "select";
+        case GB_INPUT_ACTION_START: return "start";
+        case GB_INPUT_ACTION_FAST_FORWARD: return "fast_forward";
+        case GB_INPUT_ACTION_TOGGLE_MAX_SPEED: return "toggle_max_speed";
+        case GB_INPUT_ACTION_SAVE_STATE: return "save_state";
+        case GB_INPUT_ACTION_LOAD_STATE: return "load_state";
+        case GB_INPUT_ACTION_PREVIOUS_STATE_SLOT: return "previous_state_slot";
+        case GB_INPUT_ACTION_NEXT_STATE_SLOT: return "next_state_slot";
+        case GB_INPUT_ACTION_TOGGLE_OVERLAY: return "toggle_overlay";
+        case GB_INPUT_ACTION_TOGGLE_MUTE: return "toggle_mute";
+        case GB_INPUT_ACTION_TOGGLE_MENU: return "toggle_menu";
+        case GB_INPUT_ACTION_TOGGLE_PORT_UI: return "toggle_port_ui";
+        case GB_INPUT_ACTION_COUNT:
+        default:
+            return "unknown";
+    }
+}
+
+static bool parse_input_action_name(const char* text, GBInputAction* out_action) {
+    if (!text || !out_action) {
+        return false;
+    }
+
+    for (int action = 0; action < GB_INPUT_ACTION_COUNT; action++) {
+        if (strcmp(text, input_action_config_name((GBInputAction)action)) == 0) {
+            *out_action = (GBInputAction)action;
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static void clear_all_binding_pressed_state(void) {
+    memset(g_keyboard_binding_pressed, 0, sizeof(g_keyboard_binding_pressed));
+    memset(g_controller_button_binding_pressed, 0, sizeof(g_controller_button_binding_pressed));
+    memset(g_controller_axis_binding_pressed, 0, sizeof(g_controller_axis_binding_pressed));
+    memset(g_runtime_action_pressed, 0, sizeof(g_runtime_action_pressed));
+    memset(g_controller_axis_values, 0, sizeof(g_controller_axis_values));
+    g_fast_forward_active = false;
+}
+
+static bool binding_is_valid(const GBInputBinding& binding) {
+    switch (binding.kind) {
+        case GB_INPUT_BINDING_KEY:
+            return binding.code > SDL_SCANCODE_UNKNOWN && binding.code < SDL_NUM_SCANCODES;
+
+        case GB_INPUT_BINDING_CONTROLLER_BUTTON:
+            return binding.code >= 0 && binding.code < SDL_CONTROLLER_BUTTON_MAX;
+
+        case GB_INPUT_BINDING_CONTROLLER_AXIS_POSITIVE:
+        case GB_INPUT_BINDING_CONTROLLER_AXIS_NEGATIVE:
+            return binding.code >= 0 && binding.code < SDL_CONTROLLER_AXIS_MAX;
+
+        case GB_INPUT_BINDING_NONE:
+        default:
+            return false;
+    }
+}
+
+static bool binding_matches_scancode(const GBInputBinding& binding, SDL_Scancode scancode) {
+    return binding.kind == GB_INPUT_BINDING_KEY && binding.code == (int)scancode;
+}
+
+static bool binding_matches_controller_button(const GBInputBinding& binding, uint8_t button) {
+    return binding.kind == GB_INPUT_BINDING_CONTROLLER_BUTTON && binding.code == (int)button;
+}
+
+static bool binding_active_for_axis_value(const GBInputBinding& binding, Sint16 value) {
+    const Sint16 threshold = 16000;
+    if (binding.kind == GB_INPUT_BINDING_CONTROLLER_AXIS_POSITIVE) {
+        return value >= threshold;
+    }
+    if (binding.kind == GB_INPUT_BINDING_CONTROLLER_AXIS_NEGATIVE) {
+        return value <= -threshold;
+    }
+    return false;
+}
+
+static void set_default_audio_preferences(void) {
+    g_audio_output_enabled = true;
+    g_audio_muted.store(false, std::memory_order_relaxed);
+    g_audio_latency_ms = 80;
+    g_audio_volume_percent.store(100, std::memory_order_relaxed);
+    g_audio_target_device_name.clear();
+}
+
+static void set_default_input_bindings(void) {
+    memset(g_keyboard_bindings, 0, sizeof(g_keyboard_bindings));
+    memset(g_controller_bindings, 0, sizeof(g_controller_bindings));
+
+    g_keyboard_bindings[GB_INPUT_ACTION_UP][0] = make_binding(GB_INPUT_BINDING_KEY, SDL_SCANCODE_UP);
+    g_keyboard_bindings[GB_INPUT_ACTION_UP][1] = make_binding(GB_INPUT_BINDING_KEY, SDL_SCANCODE_W);
+    g_keyboard_bindings[GB_INPUT_ACTION_DOWN][0] = make_binding(GB_INPUT_BINDING_KEY, SDL_SCANCODE_DOWN);
+    g_keyboard_bindings[GB_INPUT_ACTION_DOWN][1] = make_binding(GB_INPUT_BINDING_KEY, SDL_SCANCODE_S);
+    g_keyboard_bindings[GB_INPUT_ACTION_LEFT][0] = make_binding(GB_INPUT_BINDING_KEY, SDL_SCANCODE_LEFT);
+    g_keyboard_bindings[GB_INPUT_ACTION_LEFT][1] = make_binding(GB_INPUT_BINDING_KEY, SDL_SCANCODE_A);
+    g_keyboard_bindings[GB_INPUT_ACTION_RIGHT][0] = make_binding(GB_INPUT_BINDING_KEY, SDL_SCANCODE_RIGHT);
+    g_keyboard_bindings[GB_INPUT_ACTION_RIGHT][1] = make_binding(GB_INPUT_BINDING_KEY, SDL_SCANCODE_D);
+    g_keyboard_bindings[GB_INPUT_ACTION_A][0] = make_binding(GB_INPUT_BINDING_KEY, SDL_SCANCODE_Z);
+    g_keyboard_bindings[GB_INPUT_ACTION_A][1] = make_binding(GB_INPUT_BINDING_KEY, SDL_SCANCODE_J);
+    g_keyboard_bindings[GB_INPUT_ACTION_B][0] = make_binding(GB_INPUT_BINDING_KEY, SDL_SCANCODE_X);
+    g_keyboard_bindings[GB_INPUT_ACTION_B][1] = make_binding(GB_INPUT_BINDING_KEY, SDL_SCANCODE_K);
+    g_keyboard_bindings[GB_INPUT_ACTION_SELECT][0] = make_binding(GB_INPUT_BINDING_KEY, SDL_SCANCODE_BACKSPACE);
+    g_keyboard_bindings[GB_INPUT_ACTION_SELECT][1] = make_binding(GB_INPUT_BINDING_KEY, SDL_SCANCODE_RSHIFT);
+    g_keyboard_bindings[GB_INPUT_ACTION_START][0] = make_binding(GB_INPUT_BINDING_KEY, SDL_SCANCODE_RETURN);
+    g_keyboard_bindings[GB_INPUT_ACTION_FAST_FORWARD][0] = make_binding(GB_INPUT_BINDING_KEY, SDL_SCANCODE_TAB);
+    g_keyboard_bindings[GB_INPUT_ACTION_TOGGLE_MAX_SPEED][0] = make_binding(GB_INPUT_BINDING_KEY, SDL_SCANCODE_GRAVE);
+    g_keyboard_bindings[GB_INPUT_ACTION_SAVE_STATE][0] = make_binding(GB_INPUT_BINDING_KEY, SDL_SCANCODE_F5);
+    g_keyboard_bindings[GB_INPUT_ACTION_LOAD_STATE][0] = make_binding(GB_INPUT_BINDING_KEY, SDL_SCANCODE_F8);
+    g_keyboard_bindings[GB_INPUT_ACTION_PREVIOUS_STATE_SLOT][0] = make_binding(GB_INPUT_BINDING_KEY, SDL_SCANCODE_F6);
+    g_keyboard_bindings[GB_INPUT_ACTION_NEXT_STATE_SLOT][0] = make_binding(GB_INPUT_BINDING_KEY, SDL_SCANCODE_F7);
+    g_keyboard_bindings[GB_INPUT_ACTION_TOGGLE_OVERLAY][0] = make_binding(GB_INPUT_BINDING_KEY, SDL_SCANCODE_F1);
+    g_keyboard_bindings[GB_INPUT_ACTION_TOGGLE_MUTE][0] = make_binding(GB_INPUT_BINDING_KEY, SDL_SCANCODE_M);
+    g_keyboard_bindings[GB_INPUT_ACTION_TOGGLE_MENU][0] = make_binding(GB_INPUT_BINDING_KEY, SDL_SCANCODE_F10);
+    g_keyboard_bindings[GB_INPUT_ACTION_TOGGLE_PORT_UI][0] = make_binding(GB_INPUT_BINDING_KEY, SDL_SCANCODE_F2);
+
+    g_controller_bindings[GB_INPUT_ACTION_UP][0] = make_binding(GB_INPUT_BINDING_CONTROLLER_BUTTON, SDL_CONTROLLER_BUTTON_DPAD_UP);
+    g_controller_bindings[GB_INPUT_ACTION_UP][1] = make_binding(GB_INPUT_BINDING_CONTROLLER_AXIS_NEGATIVE, SDL_CONTROLLER_AXIS_LEFTY);
+    g_controller_bindings[GB_INPUT_ACTION_DOWN][0] = make_binding(GB_INPUT_BINDING_CONTROLLER_BUTTON, SDL_CONTROLLER_BUTTON_DPAD_DOWN);
+    g_controller_bindings[GB_INPUT_ACTION_DOWN][1] = make_binding(GB_INPUT_BINDING_CONTROLLER_AXIS_POSITIVE, SDL_CONTROLLER_AXIS_LEFTY);
+    g_controller_bindings[GB_INPUT_ACTION_LEFT][0] = make_binding(GB_INPUT_BINDING_CONTROLLER_BUTTON, SDL_CONTROLLER_BUTTON_DPAD_LEFT);
+    g_controller_bindings[GB_INPUT_ACTION_LEFT][1] = make_binding(GB_INPUT_BINDING_CONTROLLER_AXIS_NEGATIVE, SDL_CONTROLLER_AXIS_LEFTX);
+    g_controller_bindings[GB_INPUT_ACTION_RIGHT][0] = make_binding(GB_INPUT_BINDING_CONTROLLER_BUTTON, SDL_CONTROLLER_BUTTON_DPAD_RIGHT);
+    g_controller_bindings[GB_INPUT_ACTION_RIGHT][1] = make_binding(GB_INPUT_BINDING_CONTROLLER_AXIS_POSITIVE, SDL_CONTROLLER_AXIS_LEFTX);
+    g_controller_bindings[GB_INPUT_ACTION_A][0] = make_binding(GB_INPUT_BINDING_CONTROLLER_BUTTON, SDL_CONTROLLER_BUTTON_B);
+    g_controller_bindings[GB_INPUT_ACTION_A][1] = make_binding(GB_INPUT_BINDING_CONTROLLER_BUTTON, SDL_CONTROLLER_BUTTON_RIGHTSHOULDER);
+    g_controller_bindings[GB_INPUT_ACTION_B][0] = make_binding(GB_INPUT_BINDING_CONTROLLER_BUTTON, SDL_CONTROLLER_BUTTON_A);
+    g_controller_bindings[GB_INPUT_ACTION_B][1] = make_binding(GB_INPUT_BINDING_CONTROLLER_BUTTON, SDL_CONTROLLER_BUTTON_LEFTSHOULDER);
+    g_controller_bindings[GB_INPUT_ACTION_SELECT][0] = make_binding(GB_INPUT_BINDING_CONTROLLER_BUTTON, SDL_CONTROLLER_BUTTON_BACK);
+    g_controller_bindings[GB_INPUT_ACTION_START][0] = make_binding(GB_INPUT_BINDING_CONTROLLER_BUTTON, SDL_CONTROLLER_BUTTON_START);
+    g_controller_bindings[GB_INPUT_ACTION_FAST_FORWARD][0] = make_binding(GB_INPUT_BINDING_CONTROLLER_AXIS_POSITIVE, SDL_CONTROLLER_AXIS_TRIGGERRIGHT);
+    g_controller_bindings[GB_INPUT_ACTION_TOGGLE_MAX_SPEED][0] = make_binding(GB_INPUT_BINDING_CONTROLLER_AXIS_POSITIVE, SDL_CONTROLLER_AXIS_TRIGGERLEFT);
+    g_controller_bindings[GB_INPUT_ACTION_SAVE_STATE][0] = make_binding(GB_INPUT_BINDING_CONTROLLER_BUTTON, SDL_CONTROLLER_BUTTON_X);
+    g_controller_bindings[GB_INPUT_ACTION_LOAD_STATE][0] = make_binding(GB_INPUT_BINDING_CONTROLLER_BUTTON, SDL_CONTROLLER_BUTTON_Y);
+    g_controller_bindings[GB_INPUT_ACTION_TOGGLE_MENU][0] = make_binding(GB_INPUT_BINDING_CONTROLLER_BUTTON, SDL_CONTROLLER_BUTTON_LEFTSTICK);
+    g_controller_bindings[GB_INPUT_ACTION_TOGGLE_PORT_UI][0] = make_binding(GB_INPUT_BINDING_CONTROLLER_BUTTON, SDL_CONTROLLER_BUTTON_RIGHTSTICK);
+
+    clear_all_binding_pressed_state();
+}
+
+static std::string runtime_preferences_path(void) {
+    const std::string pref_dir = make_pref_storage_dir("runtime");
+    if (!pref_dir.empty()) {
+        fs::path resolved = fs::path(pref_dir) / "runtime_prefs.ini";
+        ensure_parent_directory(resolved);
+        return resolved.lexically_normal().string();
+    }
+    return fs::path("runtime_prefs.ini").lexically_normal().string();
+}
+
+static void load_runtime_preferences(void) {
+    set_default_audio_preferences();
+    set_default_input_bindings();
+    g_savestate_slot = 0;
+    g_savestate_status.clear();
+    g_max_speed_mode = false;
+    bool saw_controller_port_ui_binding = false;
+
+    // Load from config.ini
+    config_load_ini(NULL);
+    g_render_scaling_mode = (GBRenderScalingMode)g_app_config.scaling_mode;
+    g_render_filter_mode = (GBRenderFilterMode)g_app_config.filter_mode;
+    g_fullscreen = g_app_config.fullscreen;
+    g_scale = g_app_config.window_scale;
+    if (g_scale < 1) g_scale = 1;
+    if (g_scale > 8) g_scale = 8;
+    g_vsync = g_app_config.vsync;
+    g_palette_idx = g_app_config.palette_idx;
+    g_audio_output_enabled = g_app_config.audio_enabled;
+    g_audio_muted.store(g_app_config.audio_muted, std::memory_order_relaxed);
+    g_audio_volume_percent.store((uint32_t)g_app_config.audio_volume, std::memory_order_relaxed);
+    g_audio_latency_ms = g_app_config.audio_latency_ms;
+    if (g_app_config.audio_device_name[0]) {
+        g_audio_target_device_name = g_app_config.audio_device_name;
+    }
+
+    // Sync Lighting Config
+    g_lighting_config.enabled = g_app_config.flashlight_enabled;
+    g_lighting_config.intensity = g_app_config.flashlight_intensity;
+    g_lighting_config.ambient_darkness = g_app_config.ambient_darkness;
+    g_lighting_config.flicker_enabled = g_app_config.flashlight_flicker;
+
+    // Sync PostProcess / Atmosphere Config
+    g_postprocess_config.vignette_enabled = g_app_config.vignette_enabled;
+    g_postprocess_config.vignette_intensity = g_app_config.vignette_intensity;
+    g_postprocess_config.film_grain_enabled = g_app_config.film_grain_enabled;
+    g_postprocess_config.grain_intensity = g_app_config.grain_intensity;
+    g_postprocess_config.scanlines_enabled = g_app_config.scanlines_enabled;
+    g_postprocess_config.scanline_intensity = g_app_config.scanline_intensity;
+    g_postprocess_config.crt_mask_enabled = g_app_config.crt_mask_enabled;
+    g_postprocess_config.crt_mask_intensity = g_app_config.crt_mask_intensity;
+    g_postprocess_config.color_grade = (ColorGradeMode)g_app_config.color_grade_mode;
+
+    // Sync HD Pack Config
+    g_hd_pack_config.enabled = g_app_config.enable_hd_pack;
+    strncpy(g_hd_pack_config.pack_dir, g_app_config.hd_pack_path, sizeof(g_hd_pack_config.pack_dir) - 1);
+    g_hd_pack_config.enable_hd_backgrounds = g_app_config.enable_hd_backgrounds;
+    g_hd_pack_config.enable_hd_monsters = g_app_config.enable_hd_monsters;
+    g_hd_pack_config.enable_hd_portraits = g_app_config.enable_hd_portraits;
+
+    const std::string path = runtime_preferences_path();
+    if (!path.empty()) {
+        FILE* file = fopen(path.c_str(), "r");
+        if (file) {
+            char line[256];
+            while (fgets(line, sizeof(line), file)) {
+                char* text = trim_ascii(line);
+                if (!text || !text[0] || text[0] == '#') {
+                    continue;
+                }
+
+                char* equals = strchr(text, '=');
+                if (!equals) {
+                    continue;
+                }
+
+                *equals = '\0';
+                char* key = trim_ascii(text);
+                char* value = trim_ascii(equals + 1);
+                if (!key || !value || !key[0]) {
+                    continue;
+                }
+
+                if (strcmp(key, "audio.enabled") == 0) {
+                    g_audio_output_enabled = (strcmp(value, "0") != 0);
+                    continue;
+                }
+                if (strcmp(key, "audio.muted") == 0) {
+                    g_audio_muted.store(strcmp(value, "0") != 0, std::memory_order_relaxed);
+                    continue;
+                }
+                if (strcmp(key, "audio.latency_ms") == 0) {
+                    long parsed = strtol(value, NULL, 10);
+                    if (parsed > 0) {
+                        g_audio_latency_ms = (uint32_t)parsed;
+                    }
+                    continue;
+                }
+                if (strcmp(key, "audio.volume_percent") == 0) {
+                    long parsed = strtol(value, NULL, 10);
+                    if (parsed >= 0) {
+                        if (parsed > 200) parsed = 200;
+                        g_audio_volume_percent.store((uint32_t)parsed, std::memory_order_relaxed);
+                    }
+                    continue;
+                }
+                if (strcmp(key, "audio.device_name") == 0) {
+                    g_audio_target_device_name = value;
+                    continue;
+                }
+                if (strcmp(key, "savestate.slot") == 0) {
+                    long parsed = strtol(value, NULL, 10);
+                    if (parsed >= 0 && parsed < GB_SAVESTATE_SLOT_COUNT) {
+                        g_savestate_slot = (int)parsed;
+                    }
+                    continue;
+                }
+
+                bool is_keyboard = strncmp(key, "keyboard.", 9) == 0;
+                bool is_controller = strncmp(key, "controller.", 11) == 0;
+                if (!is_keyboard && !is_controller) {
+                    continue;
+                }
+
+                char* section = key + (is_keyboard ? 9 : 11);
+                char* dot = strrchr(section, '.');
+                if (!dot) {
+                    continue;
+                }
+                *dot = '\0';
+                char* slot_text = dot + 1;
+                long slot = strtol(slot_text, NULL, 10);
+                if (slot < 0 || slot >= 2) {
+                    continue;
+                }
+
+                GBInputAction action = GB_INPUT_ACTION_RIGHT;
+                if (!parse_input_action_name(section, &action)) {
+                    continue;
+                }
+
+                GBInputBinding binding = {};
+                if (strcmp(value, "none") == 0) {
+                    binding = make_binding(GB_INPUT_BINDING_NONE, 0);
+                } else if (is_keyboard) {
+                    if (strncmp(value, "key:", 4) != 0) {
+                        continue;
+                    }
+                    long code = strtol(value + 4, NULL, 10);
+                    binding = make_binding(GB_INPUT_BINDING_KEY, (int)code);
+                } else if (strncmp(value, "button:", 7) == 0) {
+                    long code = strtol(value + 7, NULL, 10);
+                    binding = make_binding(GB_INPUT_BINDING_CONTROLLER_BUTTON, (int)code);
+                } else if (strncmp(value, "axis:", 5) == 0) {
+                    char* value_copy = strdup(value + 5);
+                    if (!value_copy) {
+                        continue;
+                    }
+                    char* axis_text = strtok(value_copy, ":");
+                    char* direction_text = strtok(NULL, ":");
+                    if (axis_text && direction_text) {
+                        long axis = strtol(axis_text, NULL, 10);
+                        binding = make_binding(
+                            (strcmp(direction_text, "+") == 0) ? GB_INPUT_BINDING_CONTROLLER_AXIS_POSITIVE
+                                                                 : GB_INPUT_BINDING_CONTROLLER_AXIS_NEGATIVE,
+                            (int)axis);
+                    }
+                    free(value_copy);
+                } else {
+                    continue;
+                }
+
+                if (!binding_is_valid(binding) && binding.kind != GB_INPUT_BINDING_NONE) {
+                    continue;
+                }
+
+                if (is_keyboard) {
+                    g_keyboard_bindings[action][slot] = binding;
+                } else {
+                    g_controller_bindings[action][slot] = binding;
+                    if (action == GB_INPUT_ACTION_TOGGLE_PORT_UI) {
+                        saw_controller_port_ui_binding = true;
+                    }
+                }
+            }
+            fclose(file);
+        }
+    }
+
+    /*
+     * Runtime preferences written before the game-panel action existed stored
+     * the old default R3 binding as Toggle Menu slot 1. Preserve every custom
+     * binding, but migrate that one recognizable legacy default so an upgrade
+     * cannot open both the settings menu and the native game panel at once.
+     * Once a file contains any explicit game-panel controller binding (even
+     * "none"), the user's current choices are authoritative.
+     */
+    const GBInputBinding& legacy_menu_binding =
+        g_controller_bindings[GB_INPUT_ACTION_TOGGLE_MENU][1];
+    if (!saw_controller_port_ui_binding &&
+        legacy_menu_binding.kind == GB_INPUT_BINDING_CONTROLLER_BUTTON &&
+        legacy_menu_binding.code == SDL_CONTROLLER_BUTTON_RIGHTSTICK) {
+        g_controller_bindings[GB_INPUT_ACTION_TOGGLE_MENU][1] =
+            make_binding(GB_INPUT_BINDING_NONE, 0);
+    }
+    update_effective_joypad_state();
+}
+
+static void binding_to_config_value(const GBInputBinding& binding, char* out, size_t out_size) {
+    if (!out || out_size == 0) {
+        return;
+    }
+
+    switch (binding.kind) {
+        case GB_INPUT_BINDING_KEY:
+            snprintf(out, out_size, "key:%d", (int)binding.code);
+            break;
+
+        case GB_INPUT_BINDING_CONTROLLER_BUTTON:
+            snprintf(out, out_size, "button:%d", (int)binding.code);
+            break;
+
+        case GB_INPUT_BINDING_CONTROLLER_AXIS_POSITIVE:
+            snprintf(out, out_size, "axis:%d:+", (int)binding.code);
+            break;
+
+        case GB_INPUT_BINDING_CONTROLLER_AXIS_NEGATIVE:
+            snprintf(out, out_size, "axis:%d:-", (int)binding.code);
+            break;
+
+        case GB_INPUT_BINDING_NONE:
+        default:
+            snprintf(out, out_size, "none");
+            break;
+    }
+}
+
+static void save_runtime_preferences(void) {
+    g_app_config.scaling_mode = (int)g_render_scaling_mode;
+    g_app_config.filter_mode = (int)g_render_filter_mode;
+    g_app_config.fullscreen = g_fullscreen;
+    g_app_config.window_scale = g_scale;
+    g_app_config.vsync = g_vsync;
+    g_app_config.palette_idx = g_palette_idx;
+    g_app_config.audio_enabled = g_audio_output_enabled;
+    g_app_config.audio_muted = g_audio_muted.load(std::memory_order_relaxed);
+    g_app_config.audio_volume = (int)g_audio_volume_percent.load(std::memory_order_relaxed);
+    g_app_config.audio_latency_ms = g_audio_latency_ms;
+    strncpy(g_app_config.audio_device_name, g_audio_target_device_name.c_str(), sizeof(g_app_config.audio_device_name) - 1);
+
+    // Sync Lighting Config
+    g_app_config.flashlight_enabled = g_lighting_config.enabled;
+    g_app_config.flashlight_intensity = g_lighting_config.intensity;
+    g_app_config.ambient_darkness = g_lighting_config.ambient_darkness;
+    g_app_config.flashlight_flicker = g_lighting_config.flicker_enabled;
+
+    // Sync Atmosphere & PostProcess Config
+    g_app_config.vignette_enabled = g_postprocess_config.vignette_enabled;
+    g_app_config.vignette_intensity = g_postprocess_config.vignette_intensity;
+    g_app_config.film_grain_enabled = g_postprocess_config.film_grain_enabled;
+    g_app_config.grain_intensity = g_postprocess_config.grain_intensity;
+    g_app_config.scanlines_enabled = g_postprocess_config.scanlines_enabled;
+    g_app_config.scanline_intensity = g_postprocess_config.scanline_intensity;
+    g_app_config.crt_mask_enabled = g_postprocess_config.crt_mask_enabled;
+    g_app_config.crt_mask_intensity = g_postprocess_config.crt_mask_intensity;
+    g_app_config.color_grade_mode = (int)g_postprocess_config.color_grade;
+
+    // Sync HD Pack Config
+    g_app_config.enable_hd_pack = g_hd_pack_config.enabled;
+    strncpy(g_app_config.hd_pack_path, g_hd_pack_config.pack_dir, sizeof(g_app_config.hd_pack_path) - 1);
+    g_app_config.enable_hd_backgrounds = g_hd_pack_config.enable_hd_backgrounds;
+    g_app_config.enable_hd_monsters = g_hd_pack_config.enable_hd_monsters;
+    g_app_config.enable_hd_portraits = g_hd_pack_config.enable_hd_portraits;
+
+    config_save_ini(NULL);
+
+    const std::string path = runtime_preferences_path();
+    if (path.empty()) {
+        return;
+    }
+
+    FILE* file = fopen(path.c_str(), "w");
+    if (!file) {
+        fprintf(stderr, "[SDL] Failed to save runtime prefs to %s\n", path.c_str());
+        return;
+    }
+
+    fprintf(file, "audio.enabled=%d\n", g_audio_output_enabled ? 1 : 0);
+    fprintf(file, "audio.muted=%d\n",
+            g_audio_muted.load(std::memory_order_relaxed) ? 1 : 0);
+    fprintf(file, "audio.latency_ms=%u\n", g_audio_latency_ms);
+    fprintf(file, "audio.volume_percent=%u\n",
+            g_audio_volume_percent.load(std::memory_order_relaxed));
+    fprintf(file, "audio.device_name=%s\n", g_audio_target_device_name.c_str());
+    fprintf(file, "savestate.slot=%d\n", g_savestate_slot);
+
+    for (int action = 0; action < GB_INPUT_ACTION_COUNT; action++) {
+        for (int slot = 0; slot < 2; slot++) {
+            char value[64];
+            binding_to_config_value(g_keyboard_bindings[action][slot], value, sizeof(value));
+            fprintf(file, "keyboard.%s.%d=%s\n", input_action_config_name((GBInputAction)action), slot, value);
+        }
+    }
+
+    for (int action = 0; action < GB_INPUT_ACTION_COUNT; action++) {
+        for (int slot = 0; slot < 2; slot++) {
+            char value[64];
+            binding_to_config_value(g_controller_bindings[action][slot], value, sizeof(value));
+            fprintf(file, "controller.%s.%d=%s\n", input_action_config_name((GBInputAction)action), slot, value);
+        }
+    }
+
+    fclose(file);
+}
+
+static void set_savestate_status(const char* action, int slot, bool success, const char* detail) {
+    char message[512];
+    snprintf(message,
+             sizeof(message),
+             "%s slot %d %s%s%s",
+             action ? action : "Savestate",
+             slot + 1,
+             success ? "succeeded" : "failed",
+             (detail && detail[0]) ? ": " : "",
+             (detail && detail[0]) ? detail : "");
+    g_savestate_status = message;
+}
+
+static bool recreate_streaming_texture(void);
+static void set_app_suspended(bool suspended);
+
+static bool frame_is_selected_for_dump(const uint32_t* frames, int count, uint32_t frame) {
+    for (int i = 0; i < count; i++) {
+        if (frames[i] == frame) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Helper to parse button string "U,D,L,R,A,B,S,T" */
+static bool parse_buttons(const char* btn_str, uint8_t* dpad, uint8_t* buttons) {
+    *dpad = 0xFF;
+    *buttons = 0xFF;
+    if (!btn_str || !*btn_str) {
+        return false;
+    }
+    for (const char* cursor = btn_str; *cursor; ++cursor) {
+        switch (*cursor) {
+            case 'U': *dpad &= (uint8_t)~0x04; break;
+            case 'D': *dpad &= (uint8_t)~0x08; break;
+            case 'L': *dpad &= (uint8_t)~0x02; break;
+            case 'R': *dpad &= (uint8_t)~0x01; break;
+            case 'A': *buttons &= (uint8_t)~0x01; break;
+            case 'B': *buttons &= (uint8_t)~0x02; break;
+            case 'S': *buttons &= (uint8_t)~0x08; break; /* Start */
+            case 'T': *buttons &= (uint8_t)~0x04; break; /* Select */
+            default: return false;
+        }
+    }
+    return true;
+}
+
+static bool input_action_is_pressed(GBInputAction action) {
+    for (int slot = 0; slot < 2; slot++) {
+        if (g_keyboard_binding_pressed[action][slot] ||
+            g_controller_button_binding_pressed[action][slot] ||
+            g_controller_axis_binding_pressed[action][slot]) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void update_runtime_action_state(GBContext* ctx) {
+    const int previous_effective_speed = effective_speed_percent();
+
+    for (int action = 0; action < GB_INPUT_ACTION_COUNT; action++) {
+        if (!input_action_is_runtime((GBInputAction)action)) {
+            continue;
+        }
+
+        const bool pressed = input_action_is_pressed((GBInputAction)action);
+        const bool was_pressed = g_runtime_action_pressed[action];
+        if (pressed && !was_pressed) {
+            switch ((GBInputAction)action) {
+                case GB_INPUT_ACTION_TOGGLE_MAX_SPEED:
+                    g_max_speed_mode = !g_max_speed_mode;
+                    break;
+
+                case GB_INPUT_ACTION_SAVE_STATE:
+                    save_savestate_slot(ctx, g_savestate_slot);
+                    break;
+
+                case GB_INPUT_ACTION_LOAD_STATE:
+                    load_savestate_slot(ctx, g_savestate_slot);
+                    break;
+
+                case GB_INPUT_ACTION_PREVIOUS_STATE_SLOT:
+                    g_savestate_slot = (g_savestate_slot + GB_SAVESTATE_SLOT_COUNT - 1) % GB_SAVESTATE_SLOT_COUNT;
+                    g_savestate_status = "Selected slot " + std::to_string(g_savestate_slot + 1);
+                    save_runtime_preferences();
+                    break;
+
+                case GB_INPUT_ACTION_NEXT_STATE_SLOT:
+                    g_savestate_slot = (g_savestate_slot + 1) % GB_SAVESTATE_SLOT_COUNT;
+                    g_savestate_status = "Selected slot " + std::to_string(g_savestate_slot + 1);
+                    save_runtime_preferences();
+                    break;
+
+                case GB_INPUT_ACTION_TOGGLE_OVERLAY:
+                    g_show_overlay = !g_show_overlay;
+                    break;
+
+                case GB_INPUT_ACTION_TOGGLE_MUTE:
+                    g_audio_muted.store(!g_audio_muted.load(std::memory_order_relaxed),
+                                        std::memory_order_relaxed);
+                    save_runtime_preferences();
+                    break;
+
+                case GB_INPUT_ACTION_TOGGLE_MENU:
+                    g_show_menu = !g_show_menu;
+                    break;
+
+                case GB_INPUT_ACTION_TOGGLE_PORT_UI:
+                    if (ctx != NULL) {
+                        const GBPortInputEvent event = {
+                            GB_PORT_INPUT_TOGGLE_UI, true};
+                        gbrt_port_input(ctx, &event);
+                    }
+                    break;
+
+                case GB_INPUT_ACTION_FAST_FORWARD:
+                case GB_INPUT_ACTION_RIGHT:
+                case GB_INPUT_ACTION_LEFT:
+                case GB_INPUT_ACTION_UP:
+                case GB_INPUT_ACTION_DOWN:
+                case GB_INPUT_ACTION_A:
+                case GB_INPUT_ACTION_B:
+                case GB_INPUT_ACTION_SELECT:
+                case GB_INPUT_ACTION_START:
+                case GB_INPUT_ACTION_COUNT:
+                default:
+                    break;
+            }
+        }
+
+        g_runtime_action_pressed[action] = pressed;
+    }
+
+    g_fast_forward_active = g_runtime_action_pressed[GB_INPUT_ACTION_FAST_FORWARD];
+
+    if (effective_speed_percent() != previous_effective_speed) {
+        reset_audio_output_buffer(true);
+    }
+}
+
+static void rebuild_manual_joypad_state_from_bindings(void) {
+    g_manual_joypad_dpad = 0xFF;
+    g_manual_joypad_buttons = 0xFF;
+
+    if (input_action_is_pressed(GB_INPUT_ACTION_RIGHT)) g_manual_joypad_dpad &= (uint8_t)~0x01;
+    if (input_action_is_pressed(GB_INPUT_ACTION_LEFT)) g_manual_joypad_dpad &= (uint8_t)~0x02;
+    if (input_action_is_pressed(GB_INPUT_ACTION_UP)) g_manual_joypad_dpad &= (uint8_t)~0x04;
+    if (input_action_is_pressed(GB_INPUT_ACTION_DOWN)) g_manual_joypad_dpad &= (uint8_t)~0x08;
+    if (input_action_is_pressed(GB_INPUT_ACTION_A)) g_manual_joypad_buttons &= (uint8_t)~0x01;
+    if (input_action_is_pressed(GB_INPUT_ACTION_B)) g_manual_joypad_buttons &= (uint8_t)~0x02;
+    if (input_action_is_pressed(GB_INPUT_ACTION_SELECT)) g_manual_joypad_buttons &= (uint8_t)~0x04;
+    if (input_action_is_pressed(GB_INPUT_ACTION_START)) g_manual_joypad_buttons &= (uint8_t)~0x08;
+}
+
+static void update_effective_joypad_state(void) {
+    rebuild_manual_joypad_state_from_bindings();
+    g_joypad_dpad = g_manual_joypad_dpad & g_script_joypad_dpad;
+    g_joypad_buttons = g_manual_joypad_buttons & g_script_joypad_buttons;
+    lighting_update_player_dir(g_joypad_dpad);
+}
+
+static void request_joypad_interrupt(GBContext* ctx) {
+    if (!ctx) return;
+    ctx->io[0x0F] |= 0x10;
+    if (ctx->halted) ctx->halted = 0;
+}
+
+static bool input_state_has_press(uint8_t dpad, uint8_t buttons) {
+    return dpad != 0xFF || buttons != 0xFF;
+}
+
+static void write_buttons(FILE* file, uint8_t dpad, uint8_t buttons) {
+    if (!(dpad & 0x04)) fputc('U', file);
+    if (!(dpad & 0x08)) fputc('D', file);
+    if (!(dpad & 0x02)) fputc('L', file);
+    if (!(dpad & 0x01)) fputc('R', file);
+    if (!(buttons & 0x01)) fputc('A', file);
+    if (!(buttons & 0x02)) fputc('B', file);
+    if (!(buttons & 0x08)) fputc('S', file);
+    if (!(buttons & 0x04)) fputc('T', file);
+}
+
+static char* trim_ascii(char* text) {
+    while (text && *text && isspace((unsigned char)*text)) {
+        text++;
+    }
+    if (!text || !*text) {
+        return text;
+    }
+
+    char* end = text + strlen(text);
+    while (end > text && isspace((unsigned char)end[-1])) {
+        end--;
+    }
+    *end = '\0';
+    return text;
+}
+
+static bool parse_script_u64(char* text, uint64_t* value) {
+    if (!text || !*text || !value) {
+        return false;
+    }
+    for (const char* cursor = text; *cursor; ++cursor) {
+        if (!isdigit((unsigned char)*cursor)) {
+            return false;
+        }
+    }
+    errno = 0;
+    char* end = NULL;
+    const unsigned long long parsed = strtoull(text, &end, 10);
+    if (errno == ERANGE || !end || *end) {
+        return false;
+    }
+    *value = (uint64_t)parsed;
+    return true;
+}
+
+static bool parse_script_token(char* token, ScriptEntry* entry, char* button_buf, size_t button_buf_size) {
+    char* start_text = trim_ascii(token);
+    if (!start_text || !*start_text) {
+        return false;
+    }
+
+    char* first_colon = strchr(start_text, ':');
+    if (!first_colon) {
+        return false;
+    }
+    *first_colon = '\0';
+
+    char* buttons_text = trim_ascii(first_colon + 1);
+    char* second_colon = strchr(buttons_text, ':');
+    if (!second_colon) {
+        return false;
+    }
+    *second_colon = '\0';
+
+    char* duration_text = trim_ascii(second_colon + 1);
+    start_text = trim_ascii(start_text);
+    buttons_text = trim_ascii(buttons_text);
+    duration_text = trim_ascii(duration_text);
+    if (!*start_text || !*duration_text) {
+        return false;
+    }
+
+    entry->anchor = SCRIPT_ANCHOR_FRAME;
+    bool periodic = false;
+    if (*start_text == 'p' || *start_text == 'P') {
+        entry->anchor = SCRIPT_ANCHOR_CYCLE;
+        periodic = true;
+        start_text++;
+    } else if (*start_text == 'c' || *start_text == 'C') {
+        entry->anchor = SCRIPT_ANCHOR_CYCLE;
+        start_text++;
+    } else if (*start_text == 'f' || *start_text == 'F') {
+        start_text++;
+    }
+    start_text = trim_ascii(start_text);
+    if (!*start_text) {
+        return false;
+    }
+
+    if (!parse_script_u64(duration_text, &entry->duration)) {
+        return false;
+    }
+    if (entry->duration == 0) {
+        return false;
+    }
+    if (periodic) {
+        char* dash = strchr(start_text, '-');
+        char* slash = dash ? strchr(dash + 1, '/') : NULL;
+        if (!dash || !slash || strchr(dash + 1, '-') || strchr(slash + 1, '/')) {
+            return false;
+        }
+        *dash = '\0';
+        *slash = '\0';
+        if (!parse_script_u64(trim_ascii(start_text), &entry->start) ||
+            !parse_script_u64(trim_ascii(dash + 1), &entry->end) ||
+            !parse_script_u64(trim_ascii(slash + 1), &entry->period) ||
+            entry->end < entry->start ||
+            entry->period <= entry->duration ||
+            entry->end > UINT64_MAX - entry->duration) {
+            return false;
+        }
+    } else {
+        if (!parse_script_u64(start_text, &entry->start) ||
+            entry->start > UINT64_MAX - entry->duration) {
+            return false;
+        }
+        entry->end = entry->start;
+        entry->period = 0;
+    }
+
+    if (!*buttons_text || strlen(buttons_text) >= button_buf_size) {
+        return false;
+    }
+    snprintf(button_buf, button_buf_size, "%s", buttons_text);
+    return true;
+}
+
+static void flush_input_record_segment(void) {
+    if (!g_input_record_file || !g_input_record_has_segment) return;
+
+    uint64_t duration_cycles = 0;
+    if (g_input_record_end_cycle > g_input_record_start_cycle) {
+        duration_cycles = g_input_record_end_cycle - g_input_record_start_cycle;
+    }
+
+    if (duration_cycles > 0 && input_state_has_press(g_input_record_dpad, g_input_record_buttons)) {
+        if (g_input_record_wrote_entry) {
+            fputc(',', g_input_record_file);
+        }
+        fprintf(g_input_record_file, "c%llu:", (unsigned long long)g_input_record_start_cycle);
+        write_buttons(g_input_record_file, g_input_record_dpad, g_input_record_buttons);
+        fprintf(g_input_record_file, ":%llu", (unsigned long long)duration_cycles);
+        fflush(g_input_record_file);
+        g_input_record_wrote_entry = true;
+    }
+
+    g_input_record_has_segment = false;
+    g_input_record_start_cycle = 0;
+    g_input_record_end_cycle = 0;
+    g_input_record_dpad = 0xFF;
+    g_input_record_buttons = 0xFF;
+}
+
+static void close_input_record_file(void) {
+    if (!g_input_record_file) return;
+    flush_input_record_segment();
+    fputc('\n', g_input_record_file);
+    fclose(g_input_record_file);
+    g_input_record_file = NULL;
+    g_input_record_wrote_entry = false;
+}
+
+static void record_manual_input_state(uint64_t cycle_count) {
+    if (!g_input_record_file) return;
+
+    if (!g_input_record_has_segment) {
+        g_input_record_has_segment = true;
+        g_input_record_start_cycle = cycle_count;
+        g_input_record_end_cycle = cycle_count;
+        g_input_record_dpad = g_manual_joypad_dpad;
+        g_input_record_buttons = g_manual_joypad_buttons;
+        return;
+    }
+
+    if (g_input_record_dpad == g_manual_joypad_dpad && g_input_record_buttons == g_manual_joypad_buttons) {
+        g_input_record_end_cycle = cycle_count;
+        return;
+    }
+
+    g_input_record_end_cycle = cycle_count;
+    flush_input_record_segment();
+    g_input_record_has_segment = true;
+    g_input_record_start_cycle = cycle_count;
+    g_input_record_end_cycle = cycle_count;
+    g_input_record_dpad = g_manual_joypad_dpad;
+    g_input_record_buttons = g_manual_joypad_buttons;
+}
+
+bool gb_platform_set_input_script(const char* script) {
+    // Formats: frame:buttons:duration, ccycle:buttons:duration, or
+    // pstart-end/period:buttons:duration for periodic cycle pulses.
+    g_script_count = 0;
+    g_script_joypad_dpad = 0xFF;
+    g_script_joypad_buttons = 0xFF;
+    update_effective_joypad_state();
+
+    if (!script) return true;
+    if (!*script || script[0] == ',' || script[strlen(script) - 1] == ',' ||
+        strstr(script, ",,") != NULL) {
+        fprintf(stderr, "[AUTO] Invalid input script: empty token\n");
+        return false;
+    }
+
+    char* copy = strdup(script);
+    if (!copy) {
+        fprintf(stderr, "[AUTO] Invalid input script: allocation failed\n");
+        return false;
+    }
+    ScriptEntry parsed_entries[MAX_SCRIPT_ENTRIES] = {};
+    int parsed_count = 0;
+    char* token = strtok(copy, ",");
+
+    while (token) {
+        if (parsed_count >= MAX_SCRIPT_ENTRIES) {
+            fprintf(stderr,
+                    "[AUTO] Invalid input script: exceeds %u entries\n",
+                    (unsigned)MAX_SCRIPT_ENTRIES);
+            free(copy);
+            return false;
+        }
+        char btn_buf[16] = {0};
+        ScriptEntry parsed = {};
+
+        if (!parse_script_token(token, &parsed, btn_buf, sizeof(btn_buf)) ||
+            !parse_buttons(btn_buf, &parsed.dpad, &parsed.buttons)) {
+            fprintf(stderr, "[AUTO] Invalid input token '%s'\n", token);
+            free(copy);
+            return false;
+        }
+        parsed_entries[parsed_count++] = parsed;
+        token = strtok(NULL, ",");
+    }
+    free(copy);
+
+    memcpy(g_input_script, parsed_entries, (size_t)parsed_count * sizeof(ScriptEntry));
+    g_script_count = parsed_count;
+    printf("[AUTO] Installed %d input entries\n", g_script_count);
+    return true;
+}
+
+void gb_platform_set_input_record_file(const char* path) {
+    if (!g_input_record_exit_handler_registered) {
+        atexit(close_input_record_file);
+        g_input_record_exit_handler_registered = true;
+    }
+
+    close_input_record_file();
+    g_input_record_has_segment = false;
+    g_input_record_start_cycle = 0;
+    g_input_record_end_cycle = 0;
+    g_input_record_dpad = 0xFF;
+    g_input_record_buttons = 0xFF;
+
+    if (!path || !path[0]) return;
+
+    const std::string resolved_path = resolve_writable_path(path, "artifacts");
+    g_input_record_file = fopen(resolved_path.c_str(), "w");
+    if (!g_input_record_file) {
+        fprintf(stderr, "[AUTO] Failed to open input record file '%s'\n", resolved_path.c_str());
+        return;
+    }
+
+    fprintf(stderr, "[AUTO] Recording live input to %s (cycle anchored)\n", resolved_path.c_str());
+}
+
+void gb_platform_set_dump_frames(const char* frames) {
+    if (!frames) return;
+    char* copy = strdup(frames);
+    char* token = strtok(copy, ",");
+    g_dump_count = 0;
+    while (token && g_dump_count < MAX_DUMP_FRAMES) {
+        g_dump_frames[g_dump_count++] = (uint32_t)strtoul(token, NULL, 10);
+        token = strtok(NULL, ",");
+    }
+    free(copy);
+}
+
+void gb_platform_set_dump_present_frames(const char* frames) {
+    if (!frames) return;
+    char* copy = strdup(frames);
+    char* token = strtok(copy, ",");
+    g_dump_present_count = 0;
+    while (token && g_dump_present_count < MAX_DUMP_FRAMES) {
+        g_dump_present_frames[g_dump_present_count++] = (uint32_t)strtoul(token, NULL, 10);
+        token = strtok(NULL, ",");
+    }
+    free(copy);
+}
+
+void gb_platform_set_screenshot_prefix(const char* prefix) {
+    if (prefix) g_screenshot_prefix = prefix;
+}
+
+static void save_ppm(const char* filename, const uint32_t* fb, int width, int height, int frame_count) {
+    const std::string resolved_filename = resolve_writable_path(filename, "artifacts");
+    // Calculate simple hash
+    uint32_t hash = 0;
+    for (int k = 0; k < width * height; k++) {
+        hash = (hash * 33) ^ fb[k];
+    }
+    printf("[AUTO] Frame %d hash: %08X\n", frame_count, hash);
+
+    FILE* f = fopen(resolved_filename.c_str(), "wb");
+    if (!f) return;
+    
+    fprintf(f, "P6\n%d %d\n255\n", width, height);
+    
+    uint8_t* row = (uint8_t*)malloc(width * 3);
+    for (int y = 0; y < height; y++) {
+        for (int x = 0; x < width; x++) {
+            uint32_t p = fb[y * width + x];
+            row[x*3+0] = (p >> 16) & 0xFF; // R
+            row[x*3+1] = (p >> 8) & 0xFF;  // G
+            row[x*3+2] = (p >> 0) & 0xFF;  // B
+        }
+        fwrite(row, 1, width * 3, f);
+    }
+    
+    free(row);
+    fclose(f);
+    printf("[AUTO] Saved screenshot: %s\n", resolved_filename.c_str());
+}
+
+
+static int g_frame_count = 0;
+
+static double sdl_now_ms(void) {
+    uint64_t ticks = SDL_GetPerformanceCounter();
+    uint64_t freq = SDL_GetPerformanceFrequency();
+    return freq ? ((double)ticks * 1000.0) / (double)freq : 0.0;
+}
+
+static int round_to_int(double value) {
+    return (int)(value + 0.5);
+}
+
+static void update_render_filter(void) {
+    if (!g_renderer) {
+        return;
+    }
+
+#if SDL_VERSION_ATLEAST(2, 0, 12)
+    if (g_texture) {
+        SDL_SetTextureScaleMode(g_texture,
+                                g_render_filter_mode == GB_RENDER_FILTER_LINEAR
+                                    ? SDL_ScaleModeLinear
+                                    : SDL_ScaleModeNearest);
+    }
+#else
+    SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY,
+                g_render_filter_mode == GB_RENDER_FILTER_LINEAR ? "linear" : "nearest");
+#endif
+}
+
+static void update_game_viewport(void) {
+    int target_w = widescreen_get_target_width();
+    int target_h = widescreen_get_target_height();
+
+    if (!g_window) {
+        g_game_viewport.x = 0;
+        g_game_viewport.y = 0;
+        g_game_viewport.w = target_w * g_scale;
+        g_game_viewport.h = target_h * g_scale;
+        return;
+    }
+
+    int window_w = 0;
+    int window_h = 0;
+    SDL_GetWindowSize(g_window, &window_w, &window_h);
+    if (window_w <= 0) window_w = target_w;
+    if (window_h <= 0) window_h = target_h;
+
+    int viewport_w = window_w;
+    int viewport_h = window_h;
+
+    switch (g_render_scaling_mode) {
+        case GB_RENDER_SCALING_PIXEL_PERFECT: {
+            int scale_x = window_w / target_w;
+            int scale_y = window_h / target_h;
+            int integer_scale = (scale_x < scale_y) ? scale_x : scale_y;
+            if (integer_scale < 1) {
+                integer_scale = 1;
+            }
+            viewport_w = target_w * integer_scale;
+            viewport_h = target_h * integer_scale;
+            break;
+        }
+        case GB_RENDER_SCALING_ASPECT_FIT: {
+            double scale_x = (double)window_w / (double)target_w;
+            double scale_y = (double)window_h / (double)target_h;
+            double scale = (scale_x < scale_y) ? scale_x : scale_y;
+            if (scale <= 0.0) {
+                scale = 1.0;
+            }
+            viewport_w = round_to_int((double)target_w * scale);
+            viewport_h = round_to_int((double)target_h * scale);
+            break;
+        }
+        case GB_RENDER_SCALING_ASPECT_FILL: {
+            double scale_x = (double)window_w / (double)target_w;
+            double scale_y = (double)window_h / (double)target_h;
+            double scale = (scale_x > scale_y) ? scale_x : scale_y;
+            if (scale <= 0.0) {
+                scale = 1.0;
+            }
+            viewport_w = round_to_int((double)target_w * scale);
+            viewport_h = round_to_int((double)target_h * scale);
+            break;
+        }
+        case GB_RENDER_SCALING_STRETCH:
+        default:
+            viewport_w = window_w;
+            viewport_h = window_h;
+            break;
+    }
+
+    if (viewport_w < 1) viewport_w = 1;
+    if (viewport_h < 1) viewport_h = 1;
+
+    g_game_viewport.w = viewport_w;
+    g_game_viewport.h = viewport_h;
+    g_game_viewport.x = (window_w - viewport_w) / 2;
+    g_game_viewport.y = (window_h - viewport_h) / 2;
+}
+
+static void apply_window_scale_preset(void) {
+    int target_w = widescreen_get_target_width();
+    int target_h = widescreen_get_target_height();
+    g_windowed_width = target_w * g_scale;
+    g_windowed_height = target_h * g_scale;
+
+    if (g_window && !g_fullscreen) {
+        SDL_SetWindowSize(g_window, g_windowed_width, g_windowed_height);
+        SDL_SetWindowPosition(g_window, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
+    }
+    update_game_viewport();
+}
+
+static void set_fullscreen_enabled(bool enabled) {
+    if (!g_window || g_fullscreen == enabled) {
+        return;
+    }
+
+    if (enabled) {
+        SDL_GetWindowSize(g_window, &g_windowed_width, &g_windowed_height);
+        if (SDL_SetWindowFullscreen(g_window, SDL_WINDOW_FULLSCREEN_DESKTOP) == 0) {
+            g_fullscreen = true;
+        }
+    } else {
+        if (SDL_SetWindowFullscreen(g_window, 0) == 0) {
+            g_fullscreen = false;
+            SDL_SetWindowSize(g_window, g_windowed_width, g_windowed_height);
+            SDL_SetWindowPosition(g_window, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
+        }
+    }
+
+    update_game_viewport();
+}
+
+static bool recreate_streaming_texture(void) {
+    if (!g_renderer || g_benchmark_mode) {
+        return true;
+    }
+
+    if (g_texture) {
+        SDL_DestroyTexture(g_texture);
+        g_texture = NULL;
+    }
+
+    int target_w = widescreen_get_target_width();
+    int target_h = widescreen_get_target_height();
+    g_texture_width = target_w;
+    g_texture_height = target_h;
+
+    g_texture = SDL_CreateTexture(
+        g_renderer,
+        SDL_PIXELFORMAT_ARGB8888,
+        SDL_TEXTUREACCESS_STREAMING,
+        target_w,
+        target_h
+    );
+    if (!g_texture) {
+        fprintf(stderr, "[SDL] Failed to recreate texture: %s\n", SDL_GetError());
+        return false;
+    }
+
+    update_render_filter();
+    g_renderer_reset_pending = false;
+    return true;
+}
+
+static void set_app_suspended(bool suspended) {
+    if (g_app_suspended == suspended) {
+        return;
+    }
+
+    g_app_suspended = suspended;
+    refresh_audio_device_pause_state();
+
+    if (!suspended) {
+        g_last_frame_time = SDL_GetTicks();
+        if (g_window) {
+            update_game_viewport();
+        }
+        g_renderer_reset_pending = true;
+    }
+}
+
+static void reset_runtime_display_defaults(void) {
+    g_scale = 5;
+    g_speed_percent = 100;
+    g_palette_idx = 0;
+    g_smooth_lcd_transitions = true;
+    g_vsync = false;
+    g_show_overlay = false;
+    g_max_speed_mode = false;
+    g_render_scaling_mode = GB_RENDER_SCALING_PIXEL_PERFECT;
+    g_render_filter_mode = GB_RENDER_FILTER_NEAREST;
+    update_render_filter();
+
+    if (g_renderer) {
+        SDL_RenderSetVSync(g_renderer, 0);
+    }
+
+    const bool want_fullscreen = platform_default_fullscreen();
+    if (g_window) {
+        if (g_fullscreen != want_fullscreen) {
+            set_fullscreen_enabled(want_fullscreen);
+        }
+        if (!g_fullscreen) {
+            apply_window_scale_preset();
+        } else {
+            update_game_viewport();
+        }
+    } else {
+        g_fullscreen = want_fullscreen;
+    }
+
+    reset_audio_output_buffer(true);
+}
+
+static void reset_runtime_audio_defaults(void) {
+    set_default_audio_preferences();
+    refresh_audio_output_devices();
+    reopen_audio_output_device(true);
+    save_runtime_preferences();
+}
+
+static void reset_runtime_control_defaults(void) {
+    set_default_input_bindings();
+    update_effective_joypad_state();
+    save_runtime_preferences();
+}
+
+static void update_controller_axis_binding_state(void) {
+    for (int action = 0; action < GB_INPUT_ACTION_COUNT; action++) {
+        for (int slot = 0; slot < 2; slot++) {
+            const GBInputBinding& binding = g_controller_bindings[action][slot];
+            if (binding.kind == GB_INPUT_BINDING_CONTROLLER_AXIS_POSITIVE ||
+                binding.kind == GB_INPUT_BINDING_CONTROLLER_AXIS_NEGATIVE) {
+                Sint16 value = 0;
+                if (binding.code >= 0 && binding.code < SDL_CONTROLLER_AXIS_MAX) {
+                    value = g_controller_axis_values[binding.code];
+                }
+                g_controller_axis_binding_pressed[action][slot] = binding_active_for_axis_value(binding, value);
+            } else {
+                g_controller_axis_binding_pressed[action][slot] = false;
+            }
+        }
+    }
+}
+
+static bool input_transition_creates_press(uint8_t previous_dpad,
+                                           uint8_t previous_buttons,
+                                           uint8_t next_dpad,
+                                           uint8_t next_buttons,
+                                           bool dpad_selected,
+                                           bool buttons_selected) {
+    if (dpad_selected && ((previous_dpad & ~next_dpad) != 0)) {
+        return true;
+    }
+    if (buttons_selected && ((previous_buttons & ~next_buttons) != 0)) {
+        return true;
+    }
+    return false;
+}
+
+static bool dispatch_captured_port_input(
+    GBContext* ctx,
+    uint8_t previous_dpad,
+    uint8_t previous_buttons) {
+    if (ctx == NULL || !gbrt_port_snapshot(ctx).input_captured) return false;
+    static const GBPortInputAction dpad_actions[4] = {
+        GB_PORT_INPUT_RIGHT,
+        GB_PORT_INPUT_LEFT,
+        GB_PORT_INPUT_UP,
+        GB_PORT_INPUT_DOWN,
+    };
+    for (unsigned bit = 0; bit < 4; ++bit) {
+        const uint8_t mask = (uint8_t)(1u << bit);
+        if ((previous_dpad & mask) != 0u && (g_joypad_dpad & mask) == 0u) {
+            const GBPortInputEvent event = {dpad_actions[bit], true};
+            gbrt_port_input(ctx, &event);
+        }
+    }
+    static const GBPortInputAction button_actions[2] = {
+        GB_PORT_INPUT_ACCEPT,
+        GB_PORT_INPUT_BACK,
+    };
+    for (unsigned bit = 0; bit < 2; ++bit) {
+        const uint8_t mask = (uint8_t)(1u << bit);
+        if ((previous_buttons & mask) != 0u &&
+            (g_joypad_buttons & mask) == 0u) {
+            const GBPortInputEvent event = {button_actions[bit], true};
+            gbrt_port_input(ctx, &event);
+        }
+    }
+    g_joypad_dpad = 0xffu;
+    g_joypad_buttons = 0xffu;
+    return true;
+}
+
+static void render_binding_editor(const char* section_label,
+                                  GBBindingCaptureDevice device,
+                                  GBInputBinding bindings[GB_INPUT_ACTION_COUNT][2],
+                                  GBInputAction action_begin,
+                                  GBInputAction action_end) {
+    ImGui::TextDisabled("%s", section_label);
+    const ImGuiStyle& style = ImGui::GetStyle();
+    const float content_width = ImGui::GetContentRegionAvail().x;
+    const bool compact_layout = content_width < 720.0f;
+
+    for (int action = (int)action_begin; action < (int)action_end; action++) {
+        ImGui::PushID(section_label);
+        ImGui::PushID(action);
+        ImGui::Text("%s", g_input_action_names[action]);
+
+        const float clear_width = ImGui::CalcTextSize("Clear").x + style.FramePadding.x * 2.0f + 12.0f;
+        if (!compact_layout) {
+            const float action_column_width = content_width * 0.26f;
+            float binding_width =
+                (content_width - action_column_width - clear_width * 2.0f - style.ItemSpacing.x * 4.0f) / 2.0f;
+            if (binding_width < 120.0f) {
+                binding_width = 120.0f;
+            }
+            ImGui::SameLine(action_column_width);
+
+            for (int slot = 0; slot < 2; slot++) {
+                std::string label;
+                if (g_binding_capture_active &&
+                    g_binding_capture_device == device &&
+                    g_binding_capture_action == (GBInputAction)action &&
+                    g_binding_capture_slot == slot) {
+                    label = "Press Input...";
+                } else {
+                    label = binding_display_label(bindings[action][slot]);
+                }
+
+                ImGui::PushID(slot);
+                if (ImGui::Button(label.c_str(), ImVec2(binding_width, 0.0f))) {
+                    start_binding_capture(device, (GBInputAction)action, slot);
+                }
+                ImGui::SameLine();
+                if (ImGui::Button("Clear", ImVec2(clear_width, 0.0f))) {
+                    assign_binding_slot(device, (GBInputAction)action, slot, make_binding(GB_INPUT_BINDING_NONE, 0));
+                }
+                ImGui::PopID();
+                if (slot == 0) {
+                    ImGui::SameLine();
+                }
+            }
+        } else {
+            float compact_button_width = content_width - clear_width - style.ItemSpacing.x;
+            if (compact_button_width < 120.0f) {
+                compact_button_width = 120.0f;
+            }
+            for (int slot = 0; slot < 2; slot++) {
+                std::string label;
+                if (g_binding_capture_active &&
+                    g_binding_capture_device == device &&
+                    g_binding_capture_action == (GBInputAction)action &&
+                    g_binding_capture_slot == slot) {
+                    label = "Press Input...";
+                } else {
+                    label = binding_display_label(bindings[action][slot]);
+                }
+
+                ImGui::PushID(slot);
+                if (ImGui::Button(label.c_str(), ImVec2(compact_button_width, 0.0f))) {
+                    start_binding_capture(device, (GBInputAction)action, slot);
+                }
+                ImGui::SameLine();
+                if (ImGui::Button("Clear", ImVec2(clear_width, 0.0f))) {
+                    assign_binding_slot(device, (GBInputAction)action, slot, make_binding(GB_INPUT_BINDING_NONE, 0));
+                }
+                ImGui::PopID();
+            }
+        }
+        ImGui::PopID();
+        ImGui::PopID();
+    }
+}
+
+static void ensure_lcd_off_framebuffer(void) {
+    if (g_lcd_off_framebuffer_initialized) {
+        return;
+    }
+
+    for (int i = 0; i < GB_FRAMEBUFFER_SIZE; i++) {
+        g_lcd_off_framebuffer[i] = 0xFFE0F8D0;
+    }
+
+    g_lcd_off_framebuffer_initialized = true;
+}
+
+static void render_frame_internal(const uint32_t* framebuffer, bool count_guest_frame) {
+    if (!framebuffer) {
+        DBG_FRAME("Platform render_frame: SKIPPED (null: texture=%d, renderer=%d, fb=%d)",
+                  g_texture == NULL, g_renderer == NULL, framebuffer == NULL);
+        return;
+    }
+    g_present_count++;
+    if (count_guest_frame) {
+        g_frame_count++;
+        memcpy(g_last_guest_framebuffer, framebuffer, sizeof(g_last_guest_framebuffer));
+        g_last_guest_framebuffer_valid = true;
+    }
+
+    if (count_guest_frame) {
+        /* Handle Screenshot Dumping */
+        if (frame_is_selected_for_dump(g_dump_frames, g_dump_count, (uint32_t)g_frame_count)) {
+            char suffix[32];
+            snprintf(suffix, sizeof(suffix), "_%05d.ppm", g_frame_count);
+            const std::string filename = g_screenshot_prefix + suffix;
+            save_ppm(filename.c_str(), framebuffer, GB_SCREEN_WIDTH, GB_SCREEN_HEIGHT, g_frame_count);
+        }
+    }
+
+    if (frame_is_selected_for_dump(g_dump_present_frames, g_dump_present_count, (uint32_t)g_frame_count)) {
+        char suffix[80];
+        snprintf(suffix,
+                 sizeof(suffix),
+                 "_guest_%05d_present_%06llu.ppm",
+                 g_frame_count,
+                 (unsigned long long)g_present_count);
+        const std::string filename = g_screenshot_prefix + suffix;
+        save_ppm(filename.c_str(), framebuffer, GB_SCREEN_WIDTH, GB_SCREEN_HEIGHT, g_frame_count);
+    }
+
+    if (g_benchmark_mode) {
+        g_last_timing.upload_ms = 0.0;
+        g_last_timing.compose_ms = 0.0;
+        g_last_timing.present_ms = 0.0;
+        g_last_timing.total_render_ms = 0.0;
+        return;
+    }
+
+    if (g_benchmark_mode || g_app_suspended || !g_renderer) {
+        DBG_FRAME("Platform render_frame: host render skipped (benchmark=%d texture=%d renderer=%d)",
+                  g_benchmark_mode ? 1 : 0,
+                  g_texture == NULL,
+                  g_renderer == NULL);
+        g_last_timing.upload_ms = 0.0;
+        g_last_timing.compose_ms = 0.0;
+        g_last_timing.present_ms = 0.0;
+        g_last_timing.total_render_ms = 0.0;
+        return;
+    }
+
+    if ((!g_texture || g_renderer_reset_pending) && !recreate_streaming_texture()) {
+        g_last_timing.upload_ms = 0.0;
+        g_last_timing.compose_ms = 0.0;
+        g_last_timing.present_ms = 0.0;
+        g_last_timing.total_render_ms = 0.0;
+        return;
+    }
+
+    double total_render_start_ms = sdl_now_ms();
+
+    /* Debug: check framebuffer content on first few guest frames */
+    if (count_guest_frame && g_frame_count <= 3) {
+        bool has_content = false;
+        uint32_t white = 0xFFE0F8D0;
+        for (int i = 0; i < GB_SCREEN_WIDTH * GB_SCREEN_HEIGHT; i++) {
+            if (framebuffer[i] != white) {
+                has_content = true;
+                break;
+            }
+        }
+        DBG_FRAME("Platform frame %d - has_content=%d, first_pixel=0x%08X",
+                  g_frame_count, has_content, framebuffer[0]);
+    }
+
+    if (count_guest_frame && (g_frame_count % 60) == 0) {
+        char title[64];
+        snprintf(title, sizeof(title), "GameBoy Recompiled - Frame %d", g_frame_count);
+        SDL_SetWindowTitle(g_window, title);
+    } else if (!count_guest_frame && (g_present_count % 30) == 0) {
+        char title[96];
+        if (g_frame_count == 0) {
+            snprintf(title, sizeof(title), "GameBoy Recompiled - Starting... (%llu)",
+                     (unsigned long long)(g_present_count / 30));
+        } else {
+            snprintf(title, sizeof(title), "GameBoy Recompiled - Frame %d (Working...)",
+                     g_frame_count);
+        }
+        SDL_SetWindowTitle(g_window, title);
+    }
+
+    /* Apply active cheats every frame */
+    if (g_registered_ctx) {
+        cheats_apply_frame(g_registered_ctx);
+    }
+
+    /* Render widescreen or native frame */
+    int render_w = GB_SCREEN_WIDTH;
+    int render_h = GB_SCREEN_HEIGHT;
+    if (g_app_config.widescreen_mode != ASPECT_NATIVE_10_9 && g_registered_ctx) {
+        widescreen_render_frame(g_registered_ctx, g_wide_framebuffer, &render_w, &render_h);
+        framebuffer = g_wide_framebuffer;
+    }
+
+    static uint32_t s_processed_framebuffer[GB_MAX_FRAMEBUFFER_SIZE];
+
+    if (g_palette_idx == 0 || g_app_config.widescreen_mode != ASPECT_NATIVE_10_9) {
+        memcpy(s_processed_framebuffer, framebuffer, render_w * render_h * sizeof(uint32_t));
+    } else {
+        uint32_t original_palette[4] = { 0xFFE0F8D0, 0xFF88C070, 0xFF346856, 0xFF081820 };
+
+        for (int i = 0; i < render_w * render_h; i++) {
+            uint32_t c = framebuffer[i];
+            int color_idx = -1;
+            if (c == original_palette[0]) color_idx = 0;
+            else if (c == original_palette[1]) color_idx = 1;
+            else if (c == original_palette[2]) color_idx = 2;
+            else if (c == original_palette[3]) color_idx = 3;
+
+            if (color_idx >= 0) {
+                s_processed_framebuffer[i] = g_palettes[g_palette_idx][color_idx];
+            } else {
+                s_processed_framebuffer[i] = c;
+            }
+        }
+    }
+
+    /* 1. Apply Dynamic 2D Flashlight Lighting & Ambient Darkness */
+    if (g_registered_ctx) {
+        lighting_apply(g_registered_ctx, s_processed_framebuffer, render_w, render_h);
+    }
+
+    /* 3. Apply Atmospheric Retro Horror Shaders (Vignette, Film Grain, Scanlines, CRT, Color Grade) */
+    postprocess_apply(g_registered_ctx, s_processed_framebuffer, render_w, render_h);
+
+    if (!g_texture || g_texture_width != render_w || g_texture_height != render_h) {
+        recreate_streaming_texture();
+        update_game_viewport();
+    }
+
+    /* Update texture */
+    double upload_start_ms = sdl_now_ms();
+    void* pixels;
+    int pitch;
+    SDL_LockTexture(g_texture, NULL, &pixels, &pitch);
+
+    memcpy(pixels, s_processed_framebuffer, render_w * render_h * sizeof(uint32_t));
+
+    SDL_UnlockTexture(g_texture);
+    g_last_timing.upload_ms = sdl_now_ms() - upload_start_ms;
+
+    /* Clear and render */
+    double compose_start_ms = sdl_now_ms();
+    SDL_SetRenderDrawColor(g_renderer, 0, 0, 0, 255);
+    SDL_RenderClear(g_renderer);
+    SDL_RenderCopy(g_renderer, g_texture, NULL, &g_game_viewport);
+
+    /* Render host-resolution HD texture overlays (Battle BG, Monsters, Dialog Portraits) */
+    if (g_registered_ctx) {
+        hd_pack_render_host_overlay(g_registered_ctx, g_renderer, g_game_viewport.x, g_game_viewport.y, g_game_viewport.w, g_game_viewport.h);
+    }
+
+    ImGui_ImplSDLRenderer2_NewFrame();
+    ImGui_ImplSDL2_NewFrame();
+    ImGui::NewFrame();
+    ImGuiIO& imgui_io = ImGui::GetIO();
+    imgui_io.FontGlobalScale = settings_ui_scale_for_size(imgui_io.DisplaySize);
+
+    if (g_show_menu) {
+        const float ui_scale = imgui_io.FontGlobalScale;
+        const float footer_height = ImGui::GetFrameHeightWithSpacing() * 3.0f;
+
+        ImGui::SetNextWindowPos(ImVec2(0.0f, 0.0f), ImGuiCond_Always);
+        ImGui::SetNextWindowSize(imgui_io.DisplaySize, ImGuiCond_Always);
+        ImGui::SetNextWindowBgAlpha(0.96f);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(18.0f * ui_scale, 16.0f * ui_scale));
+        ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(14.0f * ui_scale, 10.0f * ui_scale));
+        ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(10.0f * ui_scale, 10.0f * ui_scale));
+        ImGui::PushStyleVar(ImGuiStyleVar_ScrollbarSize, 18.0f * ui_scale);
+        ImGui::Begin("Resident Evil Gaiden",
+                     &g_show_menu,
+                     ImGuiWindowFlags_NoDecoration |
+                         ImGuiWindowFlags_NoMove |
+                         ImGuiWindowFlags_NoResize |
+                         ImGuiWindowFlags_NoSavedSettings |
+                         ImGuiWindowFlags_NoCollapse);
+
+        ImGui::Text("Resident Evil Gaiden - Recompilation Engine");
+        ImGui::SameLine(ImGui::GetWindowWidth() - 120.0f * ui_scale);
+        if (ImGui::Button("Resume (Esc)", ImVec2(100.0f * ui_scale, 0.0f))) {
+            g_show_menu = false;
+        }
+        ImGui::Separator();
+
+        ImGui::BeginChild("SettingsScroll", ImVec2(0.0f, -footer_height), false);
+
+        if (ImGui::BeginTabBar("MainTabs", ImGuiTabBarFlags_None)) {
+            // Tab 1: ROM & Savestates
+            if (ImGui::BeginTabItem("ROM & Saves")) {
+                ImGui::Spacing();
+                ImGui::Text("Loaded Game: Resident Evil Gaiden (USA)");
+                ImGui::TextDisabled("Expected SHA256: %s", RE_GAIDEN_EXPECTED_SHA256);
+                ImGui::Spacing();
+#ifdef _WIN32
+                if (ImGui::Button("Select / Change ROM Image...", ImVec2(280.0f * ui_scale, 36.0f * ui_scale))) {
+                    if (rom_loader_acquire_rom(NULL)) {
+                        if (g_registered_ctx && g_rom_data) {
+                            gb_context_load_rom(g_registered_ctx, g_rom_data, g_rom_size);
+                            g_registered_ctx->mbc_type = g_rom_data[0x147];
+                            gb_context_reset(g_registered_ctx, true);
+                        }
+                    }
+                }
+#endif
+                ImGui::Separator();
+                ImGui::TextDisabled("Savestate Slots (1 - 10):");
+                for (int slot = 0; slot < GB_SAVESTATE_SLOT_COUNT; slot++) {
+                    ImGui::PushID(slot);
+                    std::string state_path;
+                    bool exists = savestate_slot_exists(g_registered_ctx, slot, &state_path);
+                    ImGui::Text("Slot %2d:  [%s]", slot + 1, exists ? "SAVED" : "EMPTY");
+                    ImGui::SameLine(180.0f * ui_scale);
+                    if (ImGui::Button("Save State")) {
+                        save_savestate_slot(g_registered_ctx, slot);
+                    }
+                    ImGui::SameLine();
+                    if (ImGui::Button("Load State")) {
+                        load_savestate_slot(g_registered_ctx, slot);
+                    }
+                    if (exists) {
+                        ImGui::SameLine();
+                        if (ImGui::Button("Delete")) {
+                            delete_savestate_slot(g_registered_ctx, slot);
+                        }
+                    }
+                    ImGui::PopID();
+                }
+                ImGui::EndTabItem();
+            }
+
+            // Tab 2: Display & Widescreen
+            if (ImGui::BeginTabItem("Display & Widescreen")) {
+                ImGui::Spacing();
+                const char* aspect_names[] = {
+                    "Native 10:9 (160x144)",
+                    "True Widescreen 16:9 (256x144 - 32x18 tiles)",
+                    "True Ultrawide 21:9 (336x144 - 42x18 tiles)"
+                };
+                int current_wide = g_app_config.widescreen_mode;
+                if (ImGui::Combo("Display Mode", &current_wide, aspect_names, IM_ARRAYSIZE(aspect_names))) {
+                    g_app_config.widescreen_mode = current_wide;
+                    recreate_streaming_texture();
+                    update_game_viewport();
+                    config_save_ini(NULL);
+                }
+                ImGui::TextWrapped("True Widescreen expands the top-down exploration viewport from 160 to 256 pixels, eliminating camera crunch and allowing you to see enemies down ship corridors without stretching.");
+                ImGui::Separator();
+
+                bool fullscreen = g_fullscreen;
+                if (ImGui::Checkbox("Fullscreen", &fullscreen)) {
+                    set_fullscreen_enabled(fullscreen);
+                    g_app_config.fullscreen = fullscreen;
+                    config_save_ini(NULL);
+                }
+
+                int scaling_mode = (int)g_render_scaling_mode;
+                if (ImGui::Combo("Scaling Mode", &scaling_mode, g_render_scaling_mode_names, IM_ARRAYSIZE(g_render_scaling_mode_names))) {
+                    g_render_scaling_mode = (GBRenderScalingMode)scaling_mode;
+                    g_app_config.scaling_mode = scaling_mode;
+                    update_game_viewport();
+                    config_save_ini(NULL);
+                }
+
+                int filter_mode = (int)g_render_filter_mode;
+                if (ImGui::Combo("Scale Filter", &filter_mode, g_render_filter_names, IM_ARRAYSIZE(g_render_filter_names))) {
+                    g_render_filter_mode = (GBRenderFilterMode)filter_mode;
+                    g_app_config.filter_mode = filter_mode;
+                    update_render_filter();
+                    config_save_ini(NULL);
+                }
+
+                if (!g_fullscreen) {
+                    int scale_idx = g_scale - 1;
+                    if (ImGui::Combo("Window Scale Size", &scale_idx, g_scale_names, IM_ARRAYSIZE(g_scale_names))) {
+                        g_scale = scale_idx + 1;
+                        g_app_config.window_scale = g_scale;
+                        apply_window_scale_preset();
+                        config_save_ini(NULL);
+                    }
+                }
+                if (ImGui::Checkbox("V-Sync", &g_vsync)) {
+                    SDL_RenderSetVSync(g_renderer, g_vsync ? 1 : 0);
+                    g_app_config.vsync = g_vsync;
+                    config_save_ini(NULL);
+                }
+                ImGui::EndTabItem();
+            }
+
+            // Tab 3: Lighting & Shaders
+            if (ImGui::BeginTabItem("Lighting & Shaders")) {
+                ImGui::Spacing();
+                ImGui::TextDisabled("Dynamic Flashlight & Lighting (2D Exploration):");
+                if (ImGui::Checkbox("Enable Flashlight Cone", &g_lighting_config.enabled)) {
+                    g_app_config.flashlight_enabled = g_lighting_config.enabled;
+                    config_save_ini(NULL);
+                }
+                if (g_lighting_config.enabled) {
+                    if (ImGui::SliderInt("Flashlight Brightness", &g_lighting_config.intensity, 10, 100)) {
+                        g_app_config.flashlight_intensity = g_lighting_config.intensity;
+                        config_save_ini(NULL);
+                    }
+                    if (ImGui::SliderInt("Corridor Ambient Darkness", &g_lighting_config.ambient_darkness, 0, 100)) {
+                        g_app_config.ambient_darkness = g_lighting_config.ambient_darkness;
+                        config_save_ini(NULL);
+                    }
+                    if (ImGui::Checkbox("Halogen Bulb Flicker", &g_lighting_config.flicker_enabled)) {
+                        g_app_config.flashlight_flicker = g_lighting_config.flicker_enabled;
+                        config_save_ini(NULL);
+                    }
+                    ImGui::SliderInt("Beam Angle (deg)", &g_lighting_config.cone_angle_deg, 30, 120);
+                    ImGui::SliderInt("Beam Reach (px)", &g_lighting_config.cone_distance, 60, 250);
+                }
+
+                ImGui::Separator();
+                ImGui::TextDisabled("Atmospheric Retro Horror Shaders:");
+                if (ImGui::Checkbox("Vignette (Corner Shadows)", &g_postprocess_config.vignette_enabled)) {
+                    g_app_config.vignette_enabled = g_postprocess_config.vignette_enabled;
+                    config_save_ini(NULL);
+                }
+                if (g_postprocess_config.vignette_enabled) {
+                    if (ImGui::SliderInt("Vignette Darkness (%)", &g_postprocess_config.vignette_intensity, 0, 100)) {
+                        g_app_config.vignette_intensity = g_postprocess_config.vignette_intensity;
+                        config_save_ini(NULL);
+                    }
+                }
+
+                if (ImGui::Checkbox("Cinematic Film Grain", &g_postprocess_config.film_grain_enabled)) {
+                    g_app_config.film_grain_enabled = g_postprocess_config.film_grain_enabled;
+                    config_save_ini(NULL);
+                }
+                if (g_postprocess_config.film_grain_enabled) {
+                    if (ImGui::SliderInt("Grain Amount (%)", &g_postprocess_config.grain_intensity, 0, 100)) {
+                        g_app_config.grain_intensity = g_postprocess_config.grain_intensity;
+                        config_save_ini(NULL);
+                    }
+                }
+
+                if (ImGui::Checkbox("CRT Scanlines", &g_postprocess_config.scanlines_enabled)) {
+                    g_app_config.scanlines_enabled = g_postprocess_config.scanlines_enabled;
+                    config_save_ini(NULL);
+                }
+                if (g_postprocess_config.scanlines_enabled) {
+                    if (ImGui::SliderInt("Scanline Intensity (%)", &g_postprocess_config.scanline_intensity, 0, 100)) {
+                        g_app_config.scanline_intensity = g_postprocess_config.scanline_intensity;
+                        config_save_ini(NULL);
+                    }
+                }
+
+                if (ImGui::Checkbox("CRT Phosphor Mask", &g_postprocess_config.crt_mask_enabled)) {
+                    g_app_config.crt_mask_enabled = g_postprocess_config.crt_mask_enabled;
+                    config_save_ini(NULL);
+                }
+                if (g_postprocess_config.crt_mask_enabled) {
+                    if (ImGui::SliderInt("Phosphor Mask (%)", &g_postprocess_config.crt_mask_intensity, 0, 100)) {
+                        g_app_config.crt_mask_intensity = g_postprocess_config.crt_mask_intensity;
+                        config_save_ini(NULL);
+                    }
+                }
+
+                const char* color_grade_names[] = {
+                    "Off (Native GBC Colors)",
+                    "Cold Biohazard Blue",
+                    "Bleach Bypass Gritty",
+                    "Sepia Retro",
+                    "Silent Monochrome"
+                };
+                int grade_idx = (int)g_postprocess_config.color_grade;
+                if (ImGui::Combo("Horror Color Profile", &grade_idx, color_grade_names, IM_ARRAYSIZE(color_grade_names))) {
+                    g_postprocess_config.color_grade = (ColorGradeMode)grade_idx;
+                    g_app_config.color_grade_mode = grade_idx;
+                    config_save_ini(NULL);
+                }
+                ImGui::EndTabItem();
+            }
+
+            // Tab 4: HD Pack & Mods
+            if (ImGui::BeginTabItem("HD Pack & Mods")) {
+                ImGui::Spacing();
+                ImGui::Text("HD PNG Texture Pack System:");
+                ImGui::Separator();
+                if (ImGui::Checkbox("Enable HD Texture Pack", &g_hd_pack_config.enabled)) {
+                    g_app_config.enable_hd_pack = g_hd_pack_config.enabled;
+                    config_save_ini(NULL);
+                }
+                ImGui::Text("Active Texture Folder: %s/", g_hd_pack_config.pack_dir);
+                ImGui::Text("Loaded HD Textures: %d", g_hd_pack_config.loaded_count);
+                ImGui::Spacing();
+                if (ImGui::Button("Reload HD Textures", ImVec2(240.0f * ui_scale, 32.0f * ui_scale))) {
+                    hd_pack_reload(g_renderer);
+                }
+                ImGui::Separator();
+                ImGui::TextDisabled("Active HD Replacements:");
+                if (ImGui::Checkbox("HD Pre-Rendered Backgrounds", &g_hd_pack_config.enable_hd_backgrounds)) {
+                    g_app_config.enable_hd_backgrounds = g_hd_pack_config.enable_hd_backgrounds;
+                    config_save_ini(NULL);
+                }
+                if (ImGui::Checkbox("HD Monster & Zombie Sprites", &g_hd_pack_config.enable_hd_monsters)) {
+                    g_app_config.enable_hd_monsters = g_hd_pack_config.enable_hd_monsters;
+                    config_save_ini(NULL);
+                }
+                if (ImGui::Checkbox("HD Character Dialogue Portraits", &g_hd_pack_config.enable_hd_portraits)) {
+                    g_app_config.enable_hd_portraits = g_hd_pack_config.enable_hd_portraits;
+                    config_save_ini(NULL);
+                }
+                ImGui::Separator();
+                ImGui::Text("HD Texture Gallery (Loaded & Active):");
+                int tex_count = hd_pack_get_texture_count();
+                for (int i = 0; i < tex_count; i++) {
+                    const HDTexture* tex = hd_pack_get_texture(i);
+                    if (tex && tex->sdl_texture) {
+                        ImGui::PushID(i);
+                        ImGui::Text("%s (%dx%d)", tex->name, tex->width, tex->height);
+                        ImGui::Image((ImTextureID)tex->sdl_texture, ImVec2(90.0f * ui_scale, 90.0f * ui_scale));
+                        ImGui::Spacing();
+                        ImGui::PopID();
+                    }
+                }
+                ImGui::EndTabItem();
+            }
+
+            // Tab 5: Controls & Mapping
+            if (ImGui::BeginTabItem("Controls & Mapping")) {
+                ImGui::Spacing();
+                if (!g_controller_name.empty()) {
+                    ImGui::Text("Detected Gamepad: %s (%s)", g_controller_name.c_str(), controller_type_name(g_controller_type));
+                } else {
+                    ImGui::TextDisabled("No gamepad detected. Connect any USB/Xbox/PlayStation controller anytime.");
+                }
+                ImGui::Separator();
+                render_binding_editor("Keyboard Controls", GB_CAPTURE_DEVICE_KEYBOARD, g_keyboard_bindings, GB_INPUT_ACTION_RIGHT, GB_INPUT_ACTION_COUNT);
+                ImGui::Separator();
+                render_binding_editor("Controller Controls (XInput / USB)", GB_CAPTURE_DEVICE_CONTROLLER, g_controller_bindings, GB_INPUT_ACTION_RIGHT, GB_INPUT_ACTION_COUNT);
+                if (g_binding_capture_active) {
+                    ImGui::Separator();
+                    ImGui::TextDisabled("Waiting for input...");
+                    if (ImGui::Button("Cancel Capture")) cancel_binding_capture();
+                }
+                if (ImGui::Button("Reset Default Controls")) {
+                    reset_runtime_control_defaults();
+                }
+                ImGui::EndTabItem();
+            }
+
+            // Tab 4: Cheats
+            if (ImGui::BeginTabItem("Cheats")) {
+                ImGui::Spacing();
+                ImGui::Text("Resident Evil Gaiden Built-in Cheats:");
+                ImGui::Separator();
+                if (ImGui::Checkbox("Infinite Health (Barry, Leon, Lucia)", &g_app_config.cheat_infinite_health)) config_save_ini(NULL);
+                if (ImGui::Checkbox("Infinite Ammo (All Weapons)", &g_app_config.cheat_infinite_ammo)) config_save_ini(NULL);
+                if (ImGui::Checkbox("One-Hit Kill in Battle", &g_app_config.cheat_one_hit_kill)) config_save_ini(NULL);
+                if (ImGui::Checkbox("Freeze Combat Reticle / Always Perfect Hit", &g_app_config.cheat_freeze_reticle)) config_save_ini(NULL);
+                if (ImGui::Checkbox("Unlock All Weapons (Shotgun, Grenades, Rifle)", &g_app_config.cheat_all_weapons)) config_save_ini(NULL);
+                if (ImGui::Checkbox("Infinite Items & First Aid Sprays", &g_app_config.cheat_infinite_items)) config_save_ini(NULL);
+
+                ImGui::Separator();
+                ImGui::TextDisabled("Custom GameShark Codes:");
+                static char custom_name[64] = "My Cheat";
+                static char custom_code[32] = "016404C8";
+                ImGui::InputText("Name", custom_name, sizeof(custom_name));
+                ImGui::InputText("Code (e.g. 016404C8)", custom_code, sizeof(custom_code));
+                if (ImGui::Button("Add GameShark Code")) {
+                    cheats_add_gameshark_code(custom_name, custom_code, true);
+                }
+
+                for (int i = 0; i < g_custom_cheat_count; ++i) {
+                    ImGui::PushID(i);
+                    ImGui::Checkbox(g_custom_cheats[i].name, &g_custom_cheats[i].enabled);
+                    ImGui::SameLine();
+                    ImGui::TextDisabled("(%s)", g_custom_cheats[i].code);
+                    ImGui::SameLine();
+                    if (ImGui::Button("Remove")) {
+                        cheats_remove_custom(i);
+                    }
+                    ImGui::PopID();
+                }
+                ImGui::EndTabItem();
+            }
+
+            // Tab 5: Audio
+            if (ImGui::BeginTabItem("Audio")) {
+                ImGui::Spacing();
+                if (ImGui::Checkbox("Enable Audio Output", &g_audio_output_enabled)) {
+                    reset_audio_output_buffer(true);
+                    g_app_config.audio_enabled = g_audio_output_enabled;
+                    config_save_ini(NULL);
+                }
+                bool audio_muted = g_audio_muted.load(std::memory_order_relaxed);
+                if (ImGui::Checkbox("Mute", &audio_muted)) {
+                    g_audio_muted.store(audio_muted, std::memory_order_relaxed);
+                    g_app_config.audio_muted = audio_muted;
+                    config_save_ini(NULL);
+                }
+                int audio_volume_percent = (int)g_audio_volume_percent.load(std::memory_order_relaxed);
+                if (ImGui::SliderInt("Master Volume (%)", &audio_volume_percent, 0, 200)) {
+                    g_audio_volume_percent.store((uint32_t)audio_volume_percent, std::memory_order_relaxed);
+                    g_app_config.audio_volume = audio_volume_percent;
+                    config_save_ini(NULL);
+                }
+                if (ImGui::BeginCombo("Output Device", current_audio_output_device_label())) {
+                    bool selected_default = g_audio_target_device_name.empty();
+                    if (ImGui::Selectable("System Default", selected_default)) {
+                        g_audio_target_device_name.clear();
+                        reopen_audio_output_device(true);
+                    }
+                    for (size_t i = 0; i < g_audio_output_devices.size(); i++) {
+                        const bool selected = g_audio_output_devices[i] == g_audio_target_device_name;
+                        if (ImGui::Selectable(g_audio_output_devices[i].c_str(), selected)) {
+                            g_audio_target_device_name = g_audio_output_devices[i];
+                            reopen_audio_output_device(true);
+                        }
+                    }
+                    ImGui::EndCombo();
+                }
+                int audio_latency_ms = (int)g_audio_latency_ms;
+                if (ImGui::SliderInt("Target Audio Latency (ms)", &audio_latency_ms, 20, 250)) {
+                    g_audio_latency_ms = (uint32_t)audio_latency_ms;
+                    g_app_config.audio_latency_ms = audio_latency_ms;
+                    recompute_audio_targets();
+                    reset_audio_output_buffer(true);
+                    config_save_ini(NULL);
+                }
+                ImGui::EndTabItem();
+            }
+
+            // Tab 6: Config & INI
+            if (ImGui::BeginTabItem("Config & INI")) {
+                ImGui::Spacing();
+                ImGui::Text("Active configuration file: config.ini");
+                ImGui::Spacing();
+                if (ImGui::Button("Save Configuration to config.ini", ImVec2(280.0f * ui_scale, 36.0f * ui_scale))) {
+                    config_save_ini(NULL);
+                }
+                if (ImGui::Button("Reload from config.ini", ImVec2(280.0f * ui_scale, 36.0f * ui_scale))) {
+                    config_load_ini(NULL);
+                }
+                if (ImGui::Button("Reset All to Defaults", ImVec2(280.0f * ui_scale, 36.0f * ui_scale))) {
+                    config_set_defaults(&g_app_config);
+                    config_save_ini(NULL);
+                }
+                ImGui::EndTabItem();
+            }
+
+            ImGui::EndTabBar();
+        }
+
+        ImGui::EndChild();
+        ImGui::Separator();
+
+        const float footer_button_width = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x) / 2.0f;
+        if (ImGui::Button("Reset Display Defaults", ImVec2(footer_button_width, 0.0f))) {
+            reset_runtime_display_defaults();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Quit Game", ImVec2(footer_button_width, 0.0f))) {
+            g_exit_action = GB_PLATFORM_EXIT_QUIT;
+            SDL_Event quit_event;
+            quit_event.type = SDL_QUIT;
+            SDL_PushEvent(&quit_event);
+        }
+        ImGui::End();
+        ImGui::PopStyleVar(6);
+    } else if (g_show_overlay) {
+        ImGui::SetNextWindowPos(ImVec2(10, 10), ImGuiCond_Always);
+        ImGui::SetNextWindowBgAlpha(0.35f);
+        if (ImGui::Begin("Overlay", NULL, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav)) {
+            update_audio_stats_from_ring();
+            ImGui::Text("FPS: %.1f", ImGui::GetIO().Framerate);
+            ImGui::Text("%s", overlay_menu_hint_text());
+            ImGui::Text("%s", overlay_visibility_hint_text());
+            ImGui::Text("Viewport: %d x %d (%s)",
+                        g_game_viewport.w,
+                        g_game_viewport.h,
+                        g_render_scaling_mode_names[(int)g_render_scaling_mode]);
+            if (g_timing_frame_count > 0) {
+                float avg_render = (float)(g_timing_render_total / g_timing_frame_count);
+                float avg_vsync = (float)(g_timing_vsync_total / g_timing_frame_count);
+                ImGui::Text("Render: %.1fms, VSync: %.1fms", avg_render, avg_vsync);
+                ImGui::Text("Upload: %.2f Compose: %.2f Present: %.2f",
+                            (float)g_last_timing.upload_ms,
+                            (float)g_last_timing.compose_ms,
+                            (float)g_last_timing.present_ms);
+                ImGui::Text("AudioBuf: %u/%u, Underruns:%u",
+                            current_audio_ring_fill_samples(),
+                            current_audio_ring_capacity(),
+                            current_audio_underruns());
+                ImGui::Text("Smooth Slow Frames: %s", g_smooth_lcd_transitions ? "On" : "Off");
+                ImGui::TextUnformatted(audio_stats_get_summary());
+                if (has_interpreter_activity(g_registered_ctx)) {
+                    const GBInterpreterHotspot* hotspot = &g_registered_ctx->interpreter_hotspots[0];
+                    ImGui::Separator();
+                    ImGui::Text("Interp: frame %u total %llu entries %llu",
+                                g_registered_ctx->frame_dispatch_fallbacks,
+                                (unsigned long long)g_registered_ctx->total_dispatch_fallbacks,
+                                (unsigned long long)g_registered_ctx->total_interpreter_entries);
+                    if (hotspot->valid && hotspot->entries > 0) {
+                        ImGui::Text("Hotspot: %03X:%04X (%llu hits)",
+                                    hotspot->bank,
+                                    hotspot->addr,
+                                    (unsigned long long)hotspot->entries);
+                    }
+                }
+            }
+            ImGui::End();
+        }
+    }
+
+    if (g_port_frame_valid &&
+        g_port_frame.abi_version == GB_PORT_ABI_VERSION &&
+        g_port_frame.canvas_width > 0 &&
+        g_port_frame.canvas_height > 0) {
+        ImDrawList* draw_list = ImGui::GetForegroundDrawList();
+        const float scale_x =
+            imgui_io.DisplaySize.x / (float)g_port_frame.canvas_width;
+        const float scale_y =
+            imgui_io.DisplaySize.y / (float)g_port_frame.canvas_height;
+        for (size_t index = 0;
+             index < g_port_frame.command_count &&
+             index < GB_PORT_MAX_DRAW_COMMANDS;
+             ++index) {
+            const GBPortDrawCommand& command = g_port_frame.commands[index];
+            const ImU32 color = IM_COL32(
+                (command.color_rgba >> 24u) & 0xffu,
+                (command.color_rgba >> 16u) & 0xffu,
+                (command.color_rgba >> 8u) & 0xffu,
+                command.color_rgba & 0xffu);
+            const ImVec2 start(
+                command.x * scale_x,
+                command.y * scale_y);
+            if (command.type == GB_PORT_DRAW_PANEL) {
+                const ImVec2 end(
+                    (command.x + command.width) * scale_x,
+                    (command.y + command.height) * scale_y);
+                draw_list->AddRectFilled(start, end, color, 10.0f);
+            } else if (command.type == GB_PORT_DRAW_TEXT) {
+                draw_list->AddText(start, color, command.text);
+            }
+        }
+    }
+
+    ImGui::Render();
+    ImGui_ImplSDLRenderer2_RenderDrawData(ImGui::GetDrawData());
+    g_last_timing.compose_ms = sdl_now_ms() - compose_start_ms;
+
+    double present_start_ms = sdl_now_ms();
+    SDL_RenderPresent(g_renderer);
+    g_last_timing.present_ms = sdl_now_ms() - present_start_ms;
+    g_last_timing.total_render_ms = sdl_now_ms() - total_render_start_ms;
+    g_timing_render_total += g_last_timing.total_render_ms;
+}
+
+/* ============================================================================
+ * Platform Functions
+ * ========================================================================== */
+
+void gb_platform_shutdown(void) {
+    hd_pack_shutdown();
+    close_input_record_file();
+    close_audio_output_device();
+    g_audio_output_devices.clear();
+    g_port_frame = {};
+    g_port_frame_valid = false;
+
+    clear_controller_state();
+    g_binding_capture_active = false;
+    g_binding_capture_device = GB_CAPTURE_DEVICE_NONE;
+    
+    if (ImGui::GetCurrentContext() != NULL) {
+        ImGui_ImplSDLRenderer2_Shutdown();
+        ImGui_ImplSDL2_Shutdown();
+        ImGui::DestroyContext();
+    }
+
+    if (g_texture) {
+        SDL_DestroyTexture(g_texture);
+        g_texture = NULL;
+    }
+    if (g_renderer) {
+        SDL_DestroyRenderer(g_renderer);
+        g_renderer = NULL;
+    }
+    if (g_window) {
+        SDL_DestroyWindow(g_window);
+        g_window = NULL;
+    }
+    g_registered_ctx = NULL;
+    g_app_suspended = false;
+    g_renderer_reset_pending = false;
+    SDL_Quit();
+}
+
+void gb_platform_set_benchmark_mode(bool enabled) {
+    g_benchmark_mode = enabled;
+}
+
+void gb_platform_set_launcher_return_enabled(bool enabled) {
+    g_launcher_return_enabled = enabled;
+}
+
+GBPlatformExitAction gb_platform_get_exit_action(void) {
+    return g_exit_action;
+}
+
+/* ============================================================================
+ * Audio - Simple Push Mode with SDL_QueueAudio
+ * ========================================================================== */
+
+#define AUDIO_SAMPLE_RATE 44100
+
+/* 
+ * Audio: Simple circular buffer with SDL callback
+ * The callback pulls samples at exactly 44100 Hz.
+ * The emulator pushes samples as they're generated.
+ * A large buffer provides tolerance for timing variations.
+ */
+#define AUDIO_RING_SIZE 16384  /* ~370ms buffer - plenty of headroom */
+#ifndef AUDIO_WRITE_BATCH_FRAMES
+#define AUDIO_WRITE_BATCH_FRAMES 32
+#endif
+static int16_t g_audio_ring[AUDIO_RING_SIZE * 2];  /* Stereo */
+static std::atomic<uint32_t> g_audio_write_pos{0};
+static std::atomic<uint32_t> g_audio_read_pos{0};
+static uint32_t g_audio_producer_write_pos = 0;
+static uint32_t g_audio_pending_write_frames = 0;
+
+/* Debug counters */
+static uint64_t g_audio_samples_written = 0;
+static uint64_t g_audio_write_publications = 0;
+static std::atomic<uint64_t> g_audio_underruns{0};
+static uint64_t g_audio_reported_underruns = 0;
+
+static bool audio_subsystem_available(void) {
+    return (SDL_WasInit(SDL_INIT_AUDIO) & SDL_INIT_AUDIO) != 0;
+}
+
+static void refresh_audio_output_devices(void) {
+    g_audio_output_devices.clear();
+    if (!audio_subsystem_available()) {
+        return;
+    }
+
+    const int count = SDL_GetNumAudioDevices(0);
+    for (int i = 0; i < count; i++) {
+        const char* name = SDL_GetAudioDeviceName(i, 0);
+        if (name && name[0]) {
+            g_audio_output_devices.emplace_back(name);
+        }
+    }
+}
+
+static int current_audio_output_device_index(void) {
+    if (g_audio_target_device_name.empty()) {
+        return 0;
+    }
+
+    for (size_t i = 0; i < g_audio_output_devices.size(); i++) {
+        if (g_audio_output_devices[i] == g_audio_target_device_name) {
+            return (int)i + 1;
+        }
+    }
+
+    return 0;
+}
+
+static const char* current_audio_output_device_label(void) {
+    if (!g_audio_target_device_name.empty()) {
+        return g_audio_target_device_name.c_str();
+    }
+    return "System Default";
+}
+
+static bool current_audio_output_device_available(void) {
+    return g_audio_target_device_name.empty() || current_audio_output_device_index() != 0;
+}
+
+static void close_audio_output_device(void) {
+    if (g_audio_device) {
+        SDL_CloseAudioDevice(g_audio_device);
+        g_audio_device = 0;
+    }
+    g_audio_started = false;
+    g_audio_start_threshold = 0;
+    g_audio_low_watermark = 0;
+    g_audio_device_sample_rate = AUDIO_SAMPLE_RATE;
+    g_audio_device_buffer_samples = 0;
+    g_audio_active_device_name.clear();
+}
+
+static bool open_audio_output_device(const char* device_name, bool preserve_stats) {
+    SDL_AudioSpec want, have;
+    memset(&want, 0, sizeof(want));
+    want.freq = AUDIO_SAMPLE_RATE;
+    want.format = AUDIO_S16LSB;
+    want.channels = 2;
+    want.samples = 2048;
+    want.callback = sdl_audio_callback;
+    want.userdata = NULL;
+
+    g_audio_device = SDL_OpenAudioDevice(device_name, 0, &want, &have, 0);
+    if (g_audio_device == 0) {
+        return false;
+    }
+
+    g_audio_device_sample_rate = (uint32_t)have.freq;
+    g_audio_device_buffer_samples = (uint32_t)have.samples;
+    g_audio_active_device_name = (device_name && device_name[0]) ? device_name : "System Default";
+    recompute_audio_targets();
+    reset_audio_output_buffer(preserve_stats);
+    fprintf(stderr,
+            "[SDL] Audio initialized: %d Hz, %d channels, device '%s', buffer %d samples, target latency %u ms\n",
+            have.freq,
+            have.channels,
+            g_audio_active_device_name.c_str(),
+            have.samples,
+            g_audio_latency_ms);
+    return true;
+}
+
+static bool reopen_audio_output_device(bool preserve_stats) {
+    if (!audio_subsystem_available()) {
+        return false;
+    }
+
+    const std::string requested_device = g_audio_target_device_name;
+    close_audio_output_device();
+
+    if (!requested_device.empty() && open_audio_output_device(requested_device.c_str(), preserve_stats)) {
+        return true;
+    }
+
+    if (!requested_device.empty()) {
+        fprintf(stderr,
+                "[SDL] Failed to open requested audio device '%s': %s. Falling back to default output.\n",
+                requested_device.c_str(),
+                SDL_GetError());
+    }
+
+    if (open_audio_output_device(NULL, preserve_stats)) {
+        return true;
+    }
+
+    fprintf(stderr, "[SDL] Failed to open audio: %s\n", SDL_GetError());
+    return false;
+}
+
+static uint32_t current_audio_underruns(void) {
+    const uint64_t underruns = g_audio_underruns.load(std::memory_order_relaxed);
+    return underruns > UINT32_MAX ? UINT32_MAX : (uint32_t)underruns;
+}
+
+static uint32_t current_audio_ring_fill_samples(void) {
+    return audio_ring_fill_samples();
+}
+
+static uint32_t current_audio_ring_capacity(void) {
+    return AUDIO_RING_SIZE;
+}
+
+static bool audio_output_should_run(void) {
+    return g_audio_device != 0 &&
+           g_audio_output_enabled &&
+           !g_benchmark_mode &&
+           !g_app_suspended &&
+           effective_speed_percent() == 100;
+}
+
+static uint32_t audio_ring_fill_samples(void) {
+    uint32_t write_pos = g_audio_write_pos.load(std::memory_order_acquire);
+    uint32_t read_pos = g_audio_read_pos.load(std::memory_order_acquire);
+    return (write_pos >= read_pos) ? (write_pos - read_pos) : (AUDIO_RING_SIZE - read_pos + write_pos);
+}
+
+static void update_audio_stats_from_ring(void) {
+    const uint64_t total_underruns = g_audio_underruns.load(std::memory_order_relaxed);
+    const uint64_t pending_underruns = total_underruns - g_audio_reported_underruns;
+    if (pending_underruns > 0) {
+        audio_stats_underruns(pending_underruns > UINT32_MAX
+                                  ? UINT32_MAX
+                                  : (uint32_t)pending_underruns);
+        g_audio_reported_underruns = total_underruns;
+    }
+    audio_stats_update_buffer(audio_ring_fill_samples(), AUDIO_RING_SIZE, g_audio_device_sample_rate);
+}
+
+static void recompute_audio_targets(void) {
+    const uint32_t sample_rate = g_audio_device_sample_rate ? g_audio_device_sample_rate : AUDIO_SAMPLE_RATE;
+    const uint32_t device_buffer = g_audio_device_buffer_samples ? g_audio_device_buffer_samples : 512u;
+    uint32_t target = (uint32_t)(((uint64_t)sample_rate * (uint64_t)g_audio_latency_ms + 999ull) / 1000ull);
+
+    if (target < device_buffer) {
+        target = device_buffer;
+    }
+    if (target == 0) {
+        target = 1;
+    }
+    if (target > (AUDIO_RING_SIZE / 2)) {
+        target = AUDIO_RING_SIZE / 2;
+    }
+
+    g_audio_start_threshold = target;
+    g_audio_low_watermark = target / 2;
+    if (g_audio_low_watermark == 0) {
+        g_audio_low_watermark = 1;
+    }
+}
+
+static void clear_audio_ring_buffer_locked(void) {
+    g_audio_write_pos.store(0, std::memory_order_relaxed);
+    g_audio_read_pos.store(0, std::memory_order_relaxed);
+    g_audio_producer_write_pos = 0;
+    g_audio_pending_write_frames = 0;
+    memset(g_audio_ring, 0, sizeof(g_audio_ring));
+    g_audio_started = false;
+    update_audio_stats_from_ring();
+}
+
+static void refresh_audio_device_pause_state(void) {
+    if (!g_audio_device) {
+        return;
+    }
+
+    const bool paused = !audio_output_should_run() || !g_audio_started;
+    SDL_PauseAudioDevice(g_audio_device, paused ? 1 : 0);
+}
+
+static void reset_audio_output_buffer(bool preserve_stats) {
+    if (g_audio_device) {
+        SDL_LockAudioDevice(g_audio_device);
+        clear_audio_ring_buffer_locked();
+        refresh_audio_device_pause_state();
+        SDL_UnlockAudioDevice(g_audio_device);
+    } else {
+        clear_audio_ring_buffer_locked();
+    }
+
+    if (!preserve_stats) {
+        g_audio_underruns.store(0, std::memory_order_relaxed);
+        g_audio_reported_underruns = 0;
+        g_audio_samples_written = 0;
+        g_audio_write_publications = 0;
+    }
+}
+
+/* SDL callback - pulls samples from ring buffer */
+static void sdl_audio_callback(void* userdata, Uint8* stream, int len) {
+    (void)userdata;
+    int16_t* out = (int16_t*)stream;
+    const uint32_t samples_needed = (uint32_t)(len / 4);
+    const bool muted = g_audio_muted.load(std::memory_order_relaxed);
+    const uint32_t volume_percent = g_audio_volume_percent.load(std::memory_order_relaxed);
+    const uint32_t write_pos = g_audio_write_pos.load(std::memory_order_acquire);
+    uint32_t read_pos = g_audio_read_pos.load(std::memory_order_relaxed);
+    const uint32_t available = (write_pos >= read_pos)
+        ? (write_pos - read_pos)
+        : (AUDIO_RING_SIZE - read_pos + write_pos);
+    const uint32_t samples_to_copy = available < samples_needed ? available : samples_needed;
+    uint32_t copied = 0;
+
+    while (copied < samples_to_copy) {
+        uint32_t contiguous = AUDIO_RING_SIZE - read_pos;
+        const uint32_t remaining = samples_to_copy - copied;
+        if (contiguous > remaining) contiguous = remaining;
+
+        if (muted || volume_percent == 0) {
+            memset(out + copied * 2, 0, (size_t)contiguous * 2u * sizeof(int16_t));
+        } else if (volume_percent == 100) {
+            memcpy(out + copied * 2,
+                   g_audio_ring + read_pos * 2,
+                   (size_t)contiguous * 2u * sizeof(int16_t));
+        } else {
+            for (uint32_t i = 0; i < contiguous; ++i) {
+                int32_t left = g_audio_ring[(read_pos + i) * 2];
+                int32_t right = g_audio_ring[(read_pos + i) * 2 + 1];
+                left = (left * (int32_t)volume_percent) / 100;
+                right = (right * (int32_t)volume_percent) / 100;
+                if (left < -32768) left = -32768;
+                if (left > 32767) left = 32767;
+                if (right < -32768) right = -32768;
+                if (right > 32767) right = 32767;
+                out[(copied + i) * 2] = (int16_t)left;
+                out[(copied + i) * 2 + 1] = (int16_t)right;
+            }
+        }
+
+        copied += contiguous;
+        read_pos = (read_pos + contiguous) % AUDIO_RING_SIZE;
+    }
+
+    const uint32_t underruns = samples_needed - copied;
+    if (underruns > 0) {
+        memset(out + copied * 2, 0, (size_t)underruns * 2u * sizeof(int16_t));
+        g_audio_underruns.fetch_add(underruns, std::memory_order_relaxed);
+    }
+
+    g_audio_read_pos.store(read_pos, std::memory_order_release);
+}
+
+static void publish_audio_write_batch(void) {
+    if (g_audio_pending_write_frames == 0) return;
+
+    g_audio_write_pos.store(g_audio_producer_write_pos, std::memory_order_release);
+    g_audio_write_publications++;
+    g_audio_samples_written += g_audio_pending_write_frames;
+    audio_stats_samples_queued(g_audio_pending_write_frames);
+    g_audio_pending_write_frames = 0;
+
+    if (!g_audio_started && audio_ring_fill_samples() >= g_audio_start_threshold) {
+        g_audio_started = true;
+        refresh_audio_device_pause_state();
+    }
+}
+
+static bool enqueue_audio_sample(int16_t left, int16_t right) {
+    const uint32_t next_write = (g_audio_producer_write_pos + 1) % AUDIO_RING_SIZE;
+    
+    /* If buffer is full, drop this sample (prevents blocking) */
+    if (next_write == g_audio_read_pos.load(std::memory_order_acquire)) {
+        publish_audio_write_batch();
+        audio_stats_samples_dropped(1);
+        return false;
+    }
+    
+    g_audio_ring[g_audio_producer_write_pos * 2] = left;
+    g_audio_ring[g_audio_producer_write_pos * 2 + 1] = right;
+    g_audio_producer_write_pos = next_write;
+    g_audio_pending_write_frames++;
+    if (g_audio_pending_write_frames >= AUDIO_WRITE_BATCH_FRAMES) {
+        publish_audio_write_batch();
+    }
+    return true;
+}
+
+static void on_audio_sample(GBContext* ctx, int16_t left, int16_t right) {
+    (void)ctx;
+    if (!audio_output_should_run()) return;
+    (void)enqueue_audio_sample(left, right);
+}
+
+#ifdef GBRT_ENABLE_TEST_HOOKS
+static void reset_audio_test_ring(void) {
+    g_audio_write_pos.store(0, std::memory_order_relaxed);
+    g_audio_read_pos.store(0, std::memory_order_relaxed);
+    g_audio_producer_write_pos = 0;
+    g_audio_pending_write_frames = 0;
+    g_audio_started = false;
+    g_audio_start_threshold = AUDIO_RING_SIZE;
+    g_audio_low_watermark = 1;
+    g_audio_samples_written = 0;
+    g_audio_write_publications = 0;
+    g_audio_underruns.store(0, std::memory_order_relaxed);
+    g_audio_reported_underruns = 0;
+    memset(g_audio_ring, 0, sizeof(g_audio_ring));
+    audio_stats_init();
+}
+
+bool gb_platform_test_audio_concurrency(uint32_t frames,
+                                        GBAudioStressResult* out_result) {
+    if (!out_result || frames < AUDIO_WRITE_BATCH_FRAMES * 4u) return false;
+
+    reset_audio_test_ring();
+    g_audio_muted.store(false, std::memory_order_relaxed);
+    g_audio_volume_percent.store(100, std::memory_order_relaxed);
+
+    /* First prove the block-copy fast path preserves exact stereo PCM. */
+    enum { PCM_TEST_FRAMES = 128 };
+    int16_t expected[PCM_TEST_FRAMES * 2];
+    int16_t actual[PCM_TEST_FRAMES * 2];
+    for (uint32_t i = 0; i < PCM_TEST_FRAMES; ++i) {
+        expected[i * 2] = (int16_t)(i * 193u);
+        expected[i * 2 + 1] = (int16_t)~expected[i * 2];
+        if (!enqueue_audio_sample(expected[i * 2], expected[i * 2 + 1])) return false;
+    }
+    publish_audio_write_batch();
+    sdl_audio_callback(NULL, (Uint8*)actual, (int)sizeof(actual));
+    if (memcmp(expected, actual, sizeof(expected)) != 0) return false;
+
+    reset_audio_test_ring();
+    std::atomic<bool> producer_done{false};
+    std::thread consumer([&producer_done]() {
+        int16_t output[256 * 2];
+        while (!producer_done.load(std::memory_order_acquire) ||
+               audio_ring_fill_samples() > 0) {
+            sdl_audio_callback(NULL, (Uint8*)output, (int)sizeof(output));
+            std::this_thread::yield();
+        }
+    });
+
+    uint64_t frames_enqueued = 0;
+    for (uint32_t i = 0; i < frames; ++i) {
+        if ((i & 0xFFu) == 0) {
+            g_audio_muted.store((i & 0x100u) != 0, std::memory_order_relaxed);
+            g_audio_volume_percent.store((i % 201u), std::memory_order_relaxed);
+            update_audio_stats_from_ring();
+        }
+        if (enqueue_audio_sample((int16_t)i, (int16_t)~i)) {
+            frames_enqueued++;
+        }
+    }
+    publish_audio_write_batch();
+    producer_done.store(true, std::memory_order_release);
+    consumer.join();
+    update_audio_stats_from_ring();
+
+    out_result->frames_enqueued = frames_enqueued;
+    out_result->write_publications = g_audio_write_publications;
+    out_result->underruns = g_audio_underruns.load(std::memory_order_relaxed);
+    return frames_enqueued > 0 &&
+           g_audio_stats.total_samples_queued == frames_enqueued &&
+           g_audio_stats.total_buffer_underruns == out_result->underruns;
+}
+#endif
+
+bool gb_platform_init(int scale) {
+    g_benchmark_mode = g_benchmark_mode || env_flag_enabled("GBRECOMP_BENCHMARK");
+    g_scale = scale;
+    if (g_scale < 1) g_scale = 1;
+    if (g_scale > 8) g_scale = 8;
+    g_windowed_width = GB_SCREEN_WIDTH * g_scale;
+    g_windowed_height = GB_SCREEN_HEIGHT * g_scale;
+    g_game_viewport = {0, 0, g_windowed_width, g_windowed_height};
+    g_exit_action = GB_PLATFORM_EXIT_QUIT;
+    g_frame_count = 0;
+    g_manual_joypad_buttons = 0xFF;
+    g_manual_joypad_dpad = 0xFF;
+    g_script_joypad_buttons = 0xFF;
+    g_script_joypad_dpad = 0xFF;
+    g_fullscreen = platform_default_fullscreen();
+    g_app_suspended = false;
+    g_renderer_reset_pending = false;
+    g_show_overlay = false;
+    g_max_speed_mode = false;
+    g_binding_capture_active = false;
+    g_binding_capture_device = GB_CAPTURE_DEVICE_NONE;
+    update_effective_joypad_state();
+    g_last_guest_framebuffer_valid = false;
+    g_present_count = 0;
+    g_last_timing = {};
+
+    if (g_benchmark_mode) {
+        if (!SDL_getenv("SDL_VIDEODRIVER")) {
+            SDL_setenv("SDL_VIDEODRIVER", "dummy", 0);
+        }
+        if (!SDL_getenv("SDL_AUDIODRIVER")) {
+            SDL_setenv("SDL_AUDIODRIVER", "dummy", 0);
+        }
+        if (SDL_Init(SDL_INIT_TIMER) < 0) {
+            fprintf(stderr, "[SDL] SDL_Init failed in benchmark mode: %s\n", SDL_GetError());
+            return false;
+        }
+        load_runtime_preferences();
+        g_last_frame_time = SDL_GetTicks();
+        return true;
+    }
+    
+    fprintf(stderr, "[SDL] Initializing SDL...\n");
+#if defined(__ANDROID__)
+    SDL_SetHint(SDL_HINT_ANDROID_TRAP_BACK_BUTTON, "1");
+    SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI, "0");
+#endif
+    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_GAMECONTROLLER) < 0) {
+        fprintf(stderr, "[SDL] SDL_Init failed: %s\n", SDL_GetError());
+        return false;
+    }
+    load_runtime_preferences();
+    lighting_init();
+    postprocess_init();
+    hd_pack_init(g_app_config.hd_pack_path);
+    fprintf(stderr, "[SDL] SDL initialized.\n");
+
+#if defined(__ANDROID__)
+    SDL_SetHint(SDL_HINT_ANDROID_TRAP_BACK_BUTTON, "1");
+#endif
+
+    install_supplemental_controller_mappings();
+    clear_controller_state();
+    open_first_available_controller();
+    refresh_audio_output_devices();
+    
+    reopen_audio_output_device(false);
+    
+    fprintf(stderr, "[SDL] Creating window...\n");
+    g_window = SDL_CreateWindow(
+        "GameBoy Recompiled",
+        SDL_WINDOWPOS_CENTERED,
+        SDL_WINDOWPOS_CENTERED,
+        g_windowed_width,
+        g_windowed_height,
+        SDL_WINDOW_SHOWN |
+        (g_fullscreen ? SDL_WINDOW_FULLSCREEN_DESKTOP : SDL_WINDOW_RESIZABLE)
+    );
+    
+    if (!g_window) {
+        fprintf(stderr, "[SDL] SDL_CreateWindow failed: %s\n", SDL_GetError());
+        SDL_Quit();
+        return false;
+    }
+    fprintf(stderr, "[SDL] Window created.\n");
+    SDL_SetWindowMinimumSize(g_window, GB_SCREEN_WIDTH, GB_SCREEN_HEIGHT);
+    
+    fprintf(stderr, "[SDL] Creating renderer...\n");
+    /* 
+     * NO VSync - we use wall-clock timing to run at exactly 59.7 FPS.
+     * This is essential for non-60Hz monitors (like 100Hz).
+     */
+    g_renderer = SDL_CreateRenderer(g_window, -1, SDL_RENDERER_ACCELERATED);
+        
+    if (!g_renderer) {
+        fprintf(stderr, "[SDL] Hardware renderer failed, trying software fallback...\n");
+        g_renderer = SDL_CreateRenderer(g_window, -1, SDL_RENDERER_SOFTWARE);
+    }
+        
+    if (!g_renderer) {
+        fprintf(stderr, "[SDL] SDL_CreateRenderer failed: %s\n", SDL_GetError());
+        SDL_DestroyWindow(g_window);
+        SDL_Quit();
+        return false;
+    }
+    
+    update_render_filter();
+    hd_pack_reload(g_renderer);
+
+    // Setup Dear ImGui context
+    IMGUI_CHECKVERSION();
+    ImGui::CreateContext();
+    ImGuiIO& io = ImGui::GetIO(); (void)io;
+    io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;     // Enable Keyboard Controls
+    io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;      // Enable Gamepad Controls
+
+    // Setup Dear ImGui style
+    ImGui::StyleColorsDark();
+
+    // Setup Platform/Renderer backends
+    ImGui_ImplSDL2_InitForSDLRenderer(g_window, g_renderer);
+    ImGui_ImplSDLRenderer2_Init(g_renderer);
+
+    if (!recreate_streaming_texture()) {
+        SDL_DestroyRenderer(g_renderer);
+        SDL_DestroyWindow(g_window);
+        SDL_Quit();
+        return false;
+    }
+    update_game_viewport();
+    
+    g_last_frame_time = SDL_GetTicks();
+    
+    return true;
+}
+
+static bool handle_binding_capture_event(const SDL_Event* event) {
+    if (!g_binding_capture_active || !event) {
+        return false;
+    }
+
+    switch (event->type) {
+        case SDL_KEYDOWN:
+            if (g_binding_capture_device != GB_CAPTURE_DEVICE_KEYBOARD || event->key.repeat != 0) {
+                return true;
+            }
+            if (event->key.keysym.scancode == SDL_SCANCODE_ESCAPE ||
+                event->key.keysym.scancode == SDL_SCANCODE_AC_BACK) {
+                cancel_binding_capture();
+                return true;
+            }
+            commit_binding_capture(make_binding(GB_INPUT_BINDING_KEY, event->key.keysym.scancode));
+            return true;
+
+        case SDL_CONTROLLERBUTTONDOWN:
+            if (g_binding_capture_device != GB_CAPTURE_DEVICE_CONTROLLER) {
+                return true;
+            }
+            if (event->cbutton.button == SDL_CONTROLLER_BUTTON_GUIDE) {
+                cancel_binding_capture();
+                return true;
+            }
+            commit_binding_capture(make_binding(GB_INPUT_BINDING_CONTROLLER_BUTTON, event->cbutton.button));
+            return true;
+
+        case SDL_CONTROLLERAXISMOTION:
+            if (g_binding_capture_device != GB_CAPTURE_DEVICE_CONTROLLER) {
+                return true;
+            }
+            if (event->caxis.value >= 16000) {
+                commit_binding_capture(make_binding(GB_INPUT_BINDING_CONTROLLER_AXIS_POSITIVE, event->caxis.axis));
+            } else if (event->caxis.value <= -16000) {
+                commit_binding_capture(make_binding(GB_INPUT_BINDING_CONTROLLER_AXIS_NEGATIVE, event->caxis.axis));
+            }
+            return true;
+
+        case SDL_KEYUP:
+        case SDL_CONTROLLERBUTTONUP:
+            return true;
+
+        default:
+            return false;
+    }
+}
+
+static bool handle_runtime_event(const SDL_Event* event, GBContext* ctx) {
+    if (!event) {
+        return true;
+    }
+
+    const uint8_t joyp = ctx ? ctx->io[0x00] : 0xFF;
+    const bool dpad_selected = !(joyp & 0x10);
+    const bool buttons_selected = !(joyp & 0x20);
+
+    if (event->type == SDL_QUIT) {
+        return false;
+    }
+    if (event->type == SDL_WINDOWEVENT &&
+        event->window.event == SDL_WINDOWEVENT_CLOSE &&
+        (!g_window || event->window.windowID == SDL_GetWindowID(g_window))) {
+        return false;
+    }
+    if (handle_binding_capture_event(event)) {
+        return true;
+    }
+
+    switch (event->type) {
+        case SDL_APP_WILLENTERBACKGROUND:
+            set_app_suspended(true);
+            break;
+
+        case SDL_APP_DIDENTERFOREGROUND:
+            set_app_suspended(false);
+            break;
+
+        case SDL_RENDER_TARGETS_RESET:
+        case SDL_RENDER_DEVICE_RESET:
+            g_renderer_reset_pending = true;
+            recreate_streaming_texture();
+            break;
+
+        case SDL_CONTROLLERDEVICEADDED:
+            if (!g_controller) {
+                open_controller_index(event->cdevice.which);
+            }
+            break;
+
+        case SDL_CONTROLLERDEVICEREMOVED:
+            if (g_controller && active_controller_instance_id() == event->cdevice.which) {
+                clear_controller_state();
+                open_first_available_controller();
+            }
+            break;
+
+        case SDL_CONTROLLERDEVICEREMAPPED:
+            if (g_controller && active_controller_instance_id() == event->cdevice.which) {
+                refresh_controller_profile();
+            }
+            break;
+
+        case SDL_AUDIODEVICEADDED:
+            if (!event->adevice.iscapture) {
+                refresh_audio_output_devices();
+            }
+            break;
+
+        case SDL_AUDIODEVICEREMOVED:
+            if (!event->adevice.iscapture) {
+                refresh_audio_output_devices();
+                if (g_audio_device != 0 && event->adevice.which == g_audio_device) {
+                    reopen_audio_output_device(true);
+                }
+            }
+            break;
+
+        case SDL_CONTROLLERAXISMOTION: {
+            uint8_t previous_dpad = g_joypad_dpad;
+            uint8_t previous_buttons = g_joypad_buttons;
+
+            if (event->caxis.axis >= 0 && event->caxis.axis < SDL_CONTROLLER_AXIS_MAX) {
+                g_controller_axis_values[event->caxis.axis] = event->caxis.value;
+            }
+            update_controller_axis_binding_state();
+            update_effective_joypad_state();
+            update_runtime_action_state(ctx);
+            const bool port_captured = dispatch_captured_port_input(
+                ctx, previous_dpad, previous_buttons);
+            if (ctx && !port_captured &&
+                input_transition_creates_press(previous_dpad,
+                                              previous_buttons,
+                                              g_joypad_dpad,
+                                              g_joypad_buttons,
+                                              dpad_selected,
+                                              buttons_selected)) {
+                request_joypad_interrupt(ctx);
+            }
+            break;
+        }
+
+        case SDL_CONTROLLERBUTTONDOWN:
+        case SDL_CONTROLLERBUTTONUP: {
+            const bool pressed = (event->type == SDL_CONTROLLERBUTTONDOWN);
+            uint8_t previous_dpad = g_joypad_dpad;
+            uint8_t previous_buttons = g_joypad_buttons;
+
+            if (event->cbutton.button == SDL_CONTROLLER_BUTTON_GUIDE) {
+                if (pressed) {
+                    g_show_menu = !g_show_menu;
+                }
+                return true;
+            }
+
+            for (int action = 0; action < GB_INPUT_ACTION_COUNT; action++) {
+                for (int slot = 0; slot < 2; slot++) {
+                    if (binding_matches_controller_button(g_controller_bindings[action][slot], event->cbutton.button)) {
+                        g_controller_button_binding_pressed[action][slot] = pressed;
+                    }
+                }
+            }
+
+            update_effective_joypad_state();
+            update_runtime_action_state(ctx);
+            const bool port_captured = dispatch_captured_port_input(
+                ctx, previous_dpad, previous_buttons);
+            if (ctx && !port_captured &&
+                pressed &&
+                input_transition_creates_press(previous_dpad,
+                                              previous_buttons,
+                                              g_joypad_dpad,
+                                              g_joypad_buttons,
+                                              dpad_selected,
+                                              buttons_selected)) {
+                request_joypad_interrupt(ctx);
+            }
+            break;
+        }
+
+        case SDL_KEYDOWN:
+        case SDL_KEYUP: {
+            const bool pressed = (event->type == SDL_KEYDOWN);
+            uint8_t previous_dpad = g_joypad_dpad;
+            uint8_t previous_buttons = g_joypad_buttons;
+
+            switch (event->key.keysym.scancode) {
+                case SDL_SCANCODE_F2:
+                    if (ctx && pressed && event->key.repeat == 0) {
+                        const GBPortInputEvent port_event = {
+                            GB_PORT_INPUT_TOGGLE_UI, true};
+                        gbrt_port_input(ctx, &port_event);
+                    }
+                    return true;
+
+                case SDL_SCANCODE_F3:
+                    if (ctx && pressed && event->key.repeat == 0) {
+                        const GBPortInputEvent port_event = {
+                            GB_PORT_INPUT_TOGGLE_ENCOUNTERS, true};
+                        gbrt_port_input(ctx, &port_event);
+                    }
+                    return true;
+
+                case SDL_SCANCODE_ESCAPE:
+                case SDL_SCANCODE_AC_BACK:
+                    if (pressed && event->key.repeat == 0) {
+                        g_show_menu = !g_show_menu;
+                    }
+                    return true;
+
+                default:
+                    break;
+            }
+
+            for (int action = 0; action < GB_INPUT_ACTION_COUNT; action++) {
+                for (int slot = 0; slot < 2; slot++) {
+                    if (binding_matches_scancode(g_keyboard_bindings[action][slot], event->key.keysym.scancode)) {
+                        g_keyboard_binding_pressed[action][slot] = pressed;
+                    }
+                }
+            }
+
+            update_effective_joypad_state();
+            update_runtime_action_state(ctx);
+            const bool port_captured = dispatch_captured_port_input(
+                ctx, previous_dpad, previous_buttons);
+            if (ctx && !port_captured &&
+                pressed &&
+                event->key.repeat == 0 &&
+                input_transition_creates_press(previous_dpad,
+                                              previous_buttons,
+                                              g_joypad_dpad,
+                                              g_joypad_buttons,
+                                              dpad_selected,
+                                              buttons_selected)) {
+                request_joypad_interrupt(ctx);
+            }
+            break;
+        }
+
+        case SDL_WINDOWEVENT:
+            if (event->window.event == SDL_WINDOWEVENT_RESIZED ||
+                event->window.event == SDL_WINDOWEVENT_SIZE_CHANGED) {
+                if (!g_fullscreen) {
+                    g_windowed_width = event->window.data1;
+                    g_windowed_height = event->window.data2;
+                }
+                update_game_viewport();
+            }
+            break;
+
+        default:
+            break;
+    }
+
+    return true;
+}
+
+bool gb_platform_poll_events(GBContext* ctx) {
+    SDL_Event event;
+
+    if (!g_benchmark_mode) {
+        while (SDL_PollEvent(&event)) {
+            if (ImGui::GetCurrentContext() != NULL) {
+                ImGui_ImplSDL2_ProcessEvent(&event);
+            }
+            if (!handle_runtime_event(&event, ctx)) {
+                return false;
+            }
+        }
+
+        while (g_app_suspended) {
+            if (!SDL_WaitEvent(&event)) {
+                continue;
+            }
+            if (ImGui::GetCurrentContext() != NULL) {
+                ImGui_ImplSDL2_ProcessEvent(&event);
+            }
+            if (!handle_runtime_event(&event, ctx)) {
+                return false;
+            }
+        }
+    }
+
+    /* Handle Automation Inputs */
+    uint8_t previous_script_dpad = g_script_joypad_dpad;
+    uint8_t previous_script_buttons = g_script_joypad_buttons;
+    g_script_joypad_dpad = 0xFF;
+    g_script_joypad_buttons = 0xFF;
+
+    uint64_t current_cycles = ctx ? ctx->total_cycles : 0;
+    for (int i = 0; i < g_script_count; i++) {
+        ScriptEntry* e = &g_input_script[i];
+        bool active = false;
+        if (e->anchor == SCRIPT_ANCHOR_CYCLE) {
+            if (e->period > 0) {
+                active = current_cycles >= e->start &&
+                         current_cycles < (e->end + e->duration) &&
+                         ((current_cycles - e->start) % e->period) < e->duration;
+            } else {
+                active = current_cycles >= e->start &&
+                         current_cycles < (e->start + e->duration);
+            }
+        } else {
+            uint64_t current_frame = (uint64_t)g_frame_count;
+            active = current_frame >= e->start &&
+                     current_frame < (e->start + e->duration);
+        }
+        if (active) {
+            g_script_joypad_dpad &= e->dpad;
+            g_script_joypad_buttons &= e->buttons;
+        }
+    }
+
+    uint8_t new_script_dpad = (uint8_t)(previous_script_dpad & (uint8_t)(~g_script_joypad_dpad) & 0x0F);
+    uint8_t new_script_buttons = (uint8_t)(previous_script_buttons & (uint8_t)(~g_script_joypad_buttons) & 0x0F);
+    uint8_t joyp = ctx ? ctx->io[0x00] : 0xFF;
+    bool dpad_selected = !(joyp & 0x10);
+    bool buttons_selected = !(joyp & 0x20);
+    if (ctx && ((new_script_dpad && dpad_selected) || (new_script_buttons && buttons_selected))) {
+        request_joypad_interrupt(ctx);
+    }
+
+    update_effective_joypad_state();
+    record_manual_input_state(current_cycles);
+
+    return true;
+}
+
+void gb_platform_submit_port_frame(void* user, const GBPortFrame* frame) {
+    (void)user;
+    if (frame == NULL || frame->abi_version != GB_PORT_ABI_VERSION ||
+        frame->command_count > GB_PORT_MAX_DRAW_COMMANDS) {
+        g_port_frame = {};
+        g_port_frame_valid = false;
+        return;
+    }
+    g_port_frame = *frame;
+    g_port_frame_valid = true;
+}
+
+
+
+void gb_platform_render_frame(const uint32_t* framebuffer) {
+    render_frame_internal(framebuffer, true);
+}
+
+void gb_platform_present_framebuffer(const uint32_t* framebuffer) {
+    const uint32_t* stable_framebuffer = g_last_guest_framebuffer_valid ? g_last_guest_framebuffer : framebuffer;
+    render_frame_internal(stable_framebuffer, false);
+}
+
+void gb_platform_render_lcd_off_frame(void) {
+    ensure_lcd_off_framebuffer();
+    const uint32_t* stable_framebuffer = g_last_guest_framebuffer_valid ? g_last_guest_framebuffer : g_lcd_off_framebuffer;
+    render_frame_internal(stable_framebuffer, false);
+}
+
+void gb_platform_get_timing_info(GBPlatformTimingInfo* out) {
+    if (!out) return;
+    *out = g_last_timing;
+}
+
+uint8_t gb_platform_get_joypad(void) {
+    /* Return combined state based on P1 register selection */
+    /* Caller should AND with the appropriate selection bits */
+    return g_joypad_buttons & g_joypad_dpad;
+}
+
+void gb_platform_vsync(uint32_t frame_cycles) {
+    if (g_benchmark_mode || g_app_suspended) {
+        g_last_timing.pacing_cycles = (frame_cycles > 0) ? frame_cycles : 70224u;
+        g_last_timing.pacing_ms = 0.0;
+        return;
+    }
+    /* 
+     * Frame pacing: Run at the DMG frame cadence derived from 70224 cycles
+     * at 4194304 Hz, and ease off sleeping when audio fill is too low.
+     *
+     * Each call accounts for the frame that just completed. Keep an
+     * accumulated wall-clock target and advance it before waiting so the
+     * current frame's cycle count is what determines the current sleep.
+     */
+    static uint64_t next_frame_time = 0;
+    static uint64_t frame_remainder = 0;
+    const uint64_t gb_frame_cycles = (frame_cycles > 0) ? (uint64_t)frame_cycles : 70224ull;
+    const uint64_t gb_cpu_hz = 4194304;
+    uint64_t freq = SDL_GetPerformanceFrequency();
+    uint64_t now = SDL_GetPerformanceCounter();
+    uint32_t speed_percent = (uint32_t)effective_speed_percent();
+    uint64_t frame_ticks_num = (freq * gb_frame_cycles * 100ull) + frame_remainder;
+    uint64_t frame_ticks_den = gb_cpu_hz * (uint64_t)speed_percent;
+    uint64_t frame_ticks = frame_ticks_num / frame_ticks_den;
+    double pacing_start_ms = sdl_now_ms();
+
+    if (frame_ticks == 0) {
+        frame_ticks = 1;
+    }
+
+    if (next_frame_time == 0) {
+        next_frame_time = now;
+    }
+
+    frame_remainder = frame_ticks_num % frame_ticks_den;
+    next_frame_time += frame_ticks;
+    uint64_t target_frame_time = next_frame_time;
+
+    uint32_t audio_fill = audio_ring_fill_samples();
+    bool audio_starved = audio_output_should_run() && g_audio_started && audio_fill < g_audio_low_watermark;
+
+    if (!audio_starved && now < target_frame_time) {
+        for (;;) {
+            uint64_t wait_ticks = target_frame_time - now;
+            uint32_t wait_us = (uint32_t)((wait_ticks * 1000000) / freq);
+
+            /*
+             * SDL_Delay() can oversleep by several milliseconds on desktop OSes.
+             * Sleep in small chunks, then busy-wait the tail for stable pacing.
+             */
+            if (wait_us > 4000) {
+                SDL_Delay((wait_us / 1000) - 2);
+            } else if (wait_us > 1500) {
+                SDL_Delay(1);
+            } else {
+                break;
+            }
+
+            now = SDL_GetPerformanceCounter();
+            if (now >= target_frame_time) {
+                break;
+            }
+        }
+
+        while (SDL_GetPerformanceCounter() < target_frame_time) {
+            /* spin */
+        }
+        now = SDL_GetPerformanceCounter();
+    }
+
+    /* If we fell behind by more than 3 frames, reset (don't try to catch up) */
+    uint64_t max_frame_lag = frame_ticks * 3;
+    if (now > target_frame_time + max_frame_lag) {
+        next_frame_time = now;
+        frame_remainder = 0;
+    }
+    
+    update_audio_stats_from_ring();
+    audio_stats_tick(SDL_GetTicks64());
+    g_last_timing.pacing_cycles = (uint32_t)gb_frame_cycles;
+    g_last_timing.pacing_ms = sdl_now_ms() - pacing_start_ms;
+    g_timing_vsync_total += g_last_timing.pacing_ms;
+    g_timing_frame_count++;
+    g_last_frame_time = SDL_GetTicks();
+}
+
+bool gb_platform_get_smooth_lcd_transitions(void) {
+    return g_smooth_lcd_transitions;
+}
+
+void gb_platform_set_smooth_lcd_transitions(bool enabled) {
+    g_smooth_lcd_transitions = enabled;
+}
+
+void gb_platform_set_title(const char* title) {
+    if (g_window && !g_benchmark_mode) {
+        SDL_SetWindowTitle(g_window, title);
+    }
+}
+
+/* ============================================================================
+ * Save Data
+ * ========================================================================== */
+
+static void sdl_get_persistent_path(char* buffer, size_t size, const char* rom_name, const char* extension) {
+    const std::string base_name = extract_path_leaf(rom_name);
+    const std::string suffix = (extension && extension[0]) ? extension : ".sav";
+    const std::string filename = base_name + suffix;
+
+    if (!g_persistence_dir.empty()) {
+        const fs::path resolved = fs::path(g_persistence_dir) / filename;
+        snprintf(buffer, size, "%s", resolved.lexically_normal().string().c_str());
+        return;
+    }
+
+#if defined(__ANDROID__)
+    const std::string resolved = resolve_writable_path(filename.c_str(), base_name.c_str());
+    snprintf(buffer, size, "%s", resolved.c_str());
+#else
+    char* base_path = SDL_GetBasePath();
+    if (base_path) {
+        fs::path resolved = fs::path(base_path) / filename;
+        SDL_free(base_path);
+        snprintf(buffer, size, "%s", resolved.lexically_normal().string().c_str());
+    } else {
+        const std::string resolved = resolve_writable_path(filename.c_str(), base_name.c_str());
+        snprintf(buffer, size, "%s", resolved.c_str());
+    }
+#endif
+}
+
+bool gb_platform_set_persistence_dir(const char* path) {
+    if (!path || !path[0]) {
+        g_persistence_dir.clear();
+        return true;
+    }
+    std::error_code error;
+    const fs::path resolved = fs::absolute(fs::path(path), error).lexically_normal();
+    if (error || !fs::is_directory(resolved, error) || error) {
+        return false;
+    }
+    g_persistence_dir = resolved.string();
+    return true;
+}
+
+static void sdl_get_save_path(char* buffer, size_t size, const char* rom_name) {
+    sdl_get_persistent_path(buffer, size, rom_name, ".sav");
+}
+
+static void sdl_get_rtc_path(char* buffer, size_t size, const char* rom_name) {
+    sdl_get_persistent_path(buffer, size, rom_name, ".rtc");
+}
+
+static void context_storage_name(const GBContext* ctx, char* buffer, size_t size) {
+    if (!buffer || size == 0) {
+        return;
+    }
+
+    buffer[0] = '\0';
+    if (ctx && ctx->save_id[0]) {
+        snprintf(buffer, size, "%s", ctx->save_id);
+        return;
+    }
+
+    if (ctx && ctx->rom && ctx->rom_size > 0x143) {
+        char title[17];
+        memset(title, 0, sizeof(title));
+        memcpy(title, &ctx->rom[0x134], 16);
+        for (int i = 0; i < 16; i++) {
+            if (title[i] == 0 || title[i] < 32 || title[i] > 126) {
+                title[i] = 0;
+            }
+        }
+        if (title[0]) {
+            snprintf(buffer, size, "%s", title);
+            return;
+        }
+    }
+
+    snprintf(buffer, size, "game");
+}
+
+static void sdl_get_savestate_path(char* buffer, size_t size, const GBContext* ctx, int slot) {
+    char storage_name[64];
+    char extension[32];
+    context_storage_name(ctx, storage_name, sizeof(storage_name));
+    if (slot < 0) {
+        slot = 0;
+    }
+    if (slot >= GB_SAVESTATE_SLOT_COUNT) {
+        slot = GB_SAVESTATE_SLOT_COUNT - 1;
+    }
+    snprintf(extension, sizeof(extension), ".state%d", slot + 1);
+    sdl_get_persistent_path(buffer, size, storage_name, extension);
+}
+
+static bool savestate_slot_exists(const GBContext* ctx, int slot, std::string* out_path) {
+    char filename[512];
+    sdl_get_savestate_path(filename, sizeof(filename), ctx, slot);
+    if (out_path) {
+        *out_path = filename;
+    }
+
+    std::error_code ec;
+    return fs::exists(fs::path(filename), ec) && !ec;
+}
+
+static bool save_savestate_slot(GBContext* ctx, int slot) {
+    if (!ctx) {
+        set_savestate_status("Save", slot, false, "No active game context");
+        return false;
+    }
+
+    char filename[512];
+    sdl_get_savestate_path(filename, sizeof(filename), ctx, slot);
+    const bool success = gb_context_save_state_file(ctx, filename);
+    set_savestate_status("Save", slot, success, filename);
+    return success;
+}
+
+static bool load_savestate_slot(GBContext* ctx, int slot) {
+    if (!ctx) {
+        set_savestate_status("Load", slot, false, "No active game context");
+        return false;
+    }
+
+    char filename[512];
+    sdl_get_savestate_path(filename, sizeof(filename), ctx, slot);
+    const bool success = gb_context_load_state_file(ctx, filename);
+    if (success) {
+        reset_audio_output_buffer(true);
+        g_last_guest_framebuffer_valid = false;
+        g_present_count = ctx->completed_frames;
+        g_last_frame_time = SDL_GetTicks();
+    }
+    set_savestate_status("Load", slot, success, filename);
+    return success;
+}
+
+static bool delete_savestate_slot(GBContext* ctx, int slot) {
+    if (!ctx) {
+        set_savestate_status("Delete", slot, false, "No active game context");
+        return false;
+    }
+
+    char filename[512];
+    sdl_get_savestate_path(filename, sizeof(filename), ctx, slot);
+    std::error_code ec;
+    const bool removed = fs::remove(fs::path(filename), ec);
+    if (!removed && !ec) {
+        set_savestate_status("Delete", slot, false, "Slot file does not exist");
+        return false;
+    }
+    set_savestate_status("Delete", slot, removed && !ec, filename);
+    return removed && !ec;
+}
+
+static const char* persistence_kind_name(GBPersistenceTestTarget target) {
+    return target == GB_PERSISTENCE_TEST_TARGET_RTC ? "RTC data" : "battery RAM";
+}
+
+void gb_platform_test_inject_persistence_fault(
+    GBPersistenceTestTarget target,
+    GBPersistenceTestFault fault) {
+    g_persistence_test_target = target;
+    g_persistence_test_fault = fault;
+}
+
+static GBPersistenceTestFault consume_persistence_test_fault(
+    GBPersistenceTestTarget target) {
+    if (g_persistence_test_fault == GB_PERSISTENCE_TEST_FAULT_NONE ||
+        g_persistence_test_target != target) {
+        return GB_PERSISTENCE_TEST_FAULT_NONE;
+    }
+    const GBPersistenceTestFault fault = g_persistence_test_fault;
+    g_persistence_test_fault = GB_PERSISTENCE_TEST_FAULT_NONE;
+    return fault;
+}
+
+static bool sync_persistence_file(FILE* file) {
+    if (fflush(file) != 0) {
+        return false;
+    }
+#if defined(_WIN32)
+    return _commit(_fileno(file)) == 0;
+#else
+    return fsync(fileno(file)) == 0;
+#endif
+}
+
+static bool replace_persistence_file(
+    const fs::path& staged,
+    const fs::path& destination) {
+#if defined(_WIN32)
+    return MoveFileExA(
+               staged.string().c_str(),
+               destination.string().c_str(),
+               MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
+#else
+    if (rename(staged.string().c_str(), destination.string().c_str()) != 0) {
+        return false;
+    }
+    const fs::path parent = destination.parent_path();
+    const int directory_fd = open(parent.string().c_str(), O_RDONLY);
+    if (directory_fd >= 0) {
+        if (fsync(directory_fd) != 0) {
+            fprintf(
+                stderr,
+                "[GBRT] Persistence transaction committed but directory sync "
+                "failed for '%s': %s\n",
+                parent.string().c_str(),
+                strerror(errno));
+        }
+        close(directory_fd);
+    }
+    return true;
+#endif
+}
+
+static bool write_persistence_transaction(
+    const char* filename,
+    const void* data,
+    size_t size,
+    GBPersistenceTestTarget target) {
+    const fs::path destination(filename);
+    const fs::path staged = destination.string() + ".tmp-v1";
+    const GBPersistenceTestFault fault =
+        consume_persistence_test_fault(target);
+    const char* kind = persistence_kind_name(target);
+
+    if (fault == GB_PERSISTENCE_TEST_FAULT_FULL_DISK) {
+        fprintf(
+            stderr,
+            "[GBRT] %s transaction v1 failed before staging '%s': "
+            "injected full-disk condition; previous file retained\n",
+            kind,
+            destination.string().c_str());
+        return false;
+    }
+
+    FILE* file = fopen(staged.string().c_str(), "wb");
+    if (!file) {
+        fprintf(
+            stderr,
+            "[GBRT] %s transaction v1 could not stage '%s': %s; "
+            "previous file retained\n",
+            kind,
+            staged.string().c_str(),
+            strerror(errno));
+        return false;
+    }
+
+    size_t requested = size;
+    if (fault == GB_PERSISTENCE_TEST_FAULT_SHORT_WRITE && requested > 0) {
+        requested--;
+    } else if (fault == GB_PERSISTENCE_TEST_FAULT_TRUNCATION) {
+        requested = size / 2;
+    }
+    const size_t written = fwrite(data, 1, requested, file);
+    bool staged_ok = written == requested && requested == size;
+    if (staged_ok) {
+        staged_ok = sync_persistence_file(file);
+    }
+    const int close_result = fclose(file);
+    staged_ok = staged_ok && close_result == 0;
+
+    if (!staged_ok) {
+        std::error_code remove_error;
+        fs::remove(staged, remove_error);
+        fprintf(
+            stderr,
+            "[GBRT] %s transaction v1 rejected staged write '%s' "
+            "(expected %zu bytes, wrote %zu); previous file retained\n",
+            kind,
+            staged.string().c_str(),
+            size,
+            written);
+        return false;
+    }
+
+    if (fault == GB_PERSISTENCE_TEST_FAULT_INTERRUPTION) {
+        fprintf(
+            stderr,
+            "[GBRT] %s transaction v1 interrupted after staging '%s'; "
+            "previous file retained and stage left for recovery\n",
+            kind,
+            staged.string().c_str());
+        return false;
+    }
+
+    if (!replace_persistence_file(staged, destination)) {
+        const int replace_error = errno;
+        std::error_code remove_error;
+        fs::remove(staged, remove_error);
+        fprintf(
+            stderr,
+            "[GBRT] %s transaction v1 could not atomically replace '%s': "
+            "%s; previous file retained\n",
+            kind,
+            destination.string().c_str(),
+            strerror(replace_error));
+        return false;
+    }
+    return true;
+}
+
+static bool sdl_load_battery_ram(GBContext* ctx, const char* rom_name, void* data, size_t size) {
+    char filename[512];
+    sdl_get_save_path(filename, sizeof(filename), rom_name);
+    
+    FILE* f = fopen(filename, "rb");
+    if (!f) return false;
+
+    std::vector<uint8_t> loaded(size);
+    size_t read = fread(loaded.data(), 1, size, f);
+    const int trailing = fgetc(f);
+    fclose(f);
+
+    if (read != size || trailing != EOF) {
+        if (ctx) {
+            ctx->persistence_load_failed = true;
+        }
+        fprintf(stderr,
+                "[GBRT] Rejected battery RAM '%s': expected exactly %zu bytes; "
+                "automatic persistence overwrite suppressed\n",
+                filename,
+                size);
+        return false;
+    }
+
+    memcpy(data, loaded.data(), size);
+    return true;
+}
+
+static bool sdl_save_battery_ram(GBContext* ctx, const char* rom_name, const void* data, size_t size) {
+    (void)ctx;
+    char filename[512];
+    sdl_get_save_path(filename, sizeof(filename), rom_name);
+    return write_persistence_transaction(
+        filename,
+        data,
+        size,
+        GB_PERSISTENCE_TEST_TARGET_BATTERY);
+}
+
+static bool sdl_load_rtc_data(GBContext* ctx, const char* rom_name, void* data, size_t size) {
+    char filename[512];
+    sdl_get_rtc_path(filename, sizeof(filename), rom_name);
+
+    FILE* f = fopen(filename, "rb");
+    if (!f) return false;
+
+    std::vector<uint8_t> loaded(size);
+    size_t read = fread(loaded.data(), 1, size, f);
+    const int trailing = fgetc(f);
+    fclose(f);
+
+    if (read != size || trailing != EOF) {
+        if (ctx) {
+            ctx->persistence_load_failed = true;
+        }
+        fprintf(stderr,
+                "[GBRT] Rejected RTC data '%s': expected exactly %zu bytes; "
+                "automatic persistence overwrite suppressed\n",
+                filename,
+                size);
+        return false;
+    }
+
+    memcpy(data, loaded.data(), size);
+    return true;
+}
+
+static bool sdl_save_rtc_data(GBContext* ctx, const char* rom_name, const void* data, size_t size) {
+    (void)ctx;
+    char filename[512];
+    sdl_get_rtc_path(filename, sizeof(filename), rom_name);
+
+    return write_persistence_transaction(
+        filename,
+        data,
+        size,
+        GB_PERSISTENCE_TEST_TARGET_RTC);
+}
+
+void gb_platform_register_context(GBContext* ctx) {
+    g_registered_ctx = ctx;
+    GBPlatformCallbacks callbacks = {
+        .on_audio_sample = on_audio_sample,
+        .load_battery_ram = sdl_load_battery_ram,
+        .save_battery_ram = sdl_save_battery_ram,
+        .load_rtc_data = sdl_load_rtc_data,
+        .save_rtc_data = sdl_save_rtc_data
+    };
+    gb_set_platform_callbacks(ctx, &callbacks);
+}
+
+#else  /* !GB_HAS_SDL2 */
+
+/* Stub implementations when SDL2 is not available */
+
+bool gb_platform_init(int scale) {
+    (void)scale;
+    return false;
+}
+
+void gb_platform_shutdown(void) {}
+
+void gb_platform_set_launcher_return_enabled(bool enabled) {
+    (void)enabled;
+}
+
+GBPlatformExitAction gb_platform_get_exit_action(void) {
+    return GB_PLATFORM_EXIT_QUIT;
+}
+
+bool gb_platform_poll_events(GBContext* ctx) {
+    (void)ctx;
+    return true;
+}
+
+bool gb_platform_set_input_script(const char* script) {
+    return script == NULL || *script == '\0';
+}
+
+bool gb_platform_set_persistence_dir(const char* path) {
+    return path == NULL || *path == '\0';
+}
+
+void gb_platform_test_inject_persistence_fault(
+    GBPersistenceTestTarget target,
+    GBPersistenceTestFault fault) {
+    (void)target;
+    (void)fault;
+}
+
+void gb_platform_set_input_record_file(const char* path) { (void)path; }
+void gb_platform_set_benchmark_mode(bool enabled) { (void)enabled; }
+void gb_platform_submit_port_frame(void* user, const GBPortFrame* frame) {
+    (void)user;
+    (void)frame;
+}
+
+void gb_platform_render_frame(const uint32_t* framebuffer) {
+    (void)framebuffer;
+}
+
+void gb_platform_present_framebuffer(const uint32_t* framebuffer) {
+    (void)framebuffer;
+}
+
+void gb_platform_render_lcd_off_frame(void) {}
+
+void gb_platform_get_timing_info(GBPlatformTimingInfo* out) {
+    if (!out) return;
+    *out = GBPlatformTimingInfo{};
+}
+
+uint8_t gb_platform_get_joypad(void) {
+    return 0xFF;
+}
+
+void gb_platform_vsync(uint32_t frame_cycles) { (void)frame_cycles; }
+
+bool gb_platform_get_smooth_lcd_transitions(void) { return false; }
+
+void gb_platform_set_smooth_lcd_transitions(bool enabled) { (void)enabled; }
+
+void gb_platform_set_title(const char* title) {
+    (void)title;
+}
+
+void gb_platform_set_dump_frames(const char* frames) { (void)frames; }
+
+void gb_platform_set_screenshot_prefix(const char* prefix) { (void)prefix; }
+
+void gb_platform_register_context(GBContext* ctx) { (void)ctx; }
+
+#endif /* GB_HAS_SDL2 */
