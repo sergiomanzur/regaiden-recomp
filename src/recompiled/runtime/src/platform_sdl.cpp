@@ -41,6 +41,7 @@
 #include "postprocess.h"
 #include "hd_pack.h"
 #include "touch_overlay.h"
+#include "stb_image.h"
 
 namespace fs = std::filesystem;
 
@@ -3421,7 +3422,7 @@ bool gb_platform_init(int scale) {
     
     fprintf(stderr, "[SDL] Creating window...\n");
     g_window = SDL_CreateWindow(
-        "GameBoy Recompiled",
+        "Resident Evil Gaiden Recompiled",
         SDL_WINDOWPOS_CENTERED,
         SDL_WINDOWPOS_CENTERED,
         g_windowed_width,
@@ -3437,6 +3438,24 @@ bool gb_platform_init(int scale) {
     }
     fprintf(stderr, "[SDL] Window created.\n");
     SDL_SetWindowMinimumSize(g_window, GB_SCREEN_WIDTH, GB_SCREEN_HEIGHT);
+
+    // Set Window Icon
+    int icon_w = 0, icon_h = 0, icon_channels = 0;
+    unsigned char* icon_pixels = stbi_load("hd_pack/icon.png", &icon_w, &icon_h, &icon_channels, 4);
+    if (!icon_pixels) {
+        icon_pixels = stbi_load("app_icon.png", &icon_w, &icon_h, &icon_channels, 4);
+    }
+    if (icon_pixels && icon_w > 0 && icon_h > 0) {
+        SDL_Surface* icon_surf = SDL_CreateRGBSurfaceFrom(
+            icon_pixels, icon_w, icon_h, 32, icon_w * 4,
+            0x000000FF, 0x0000FF00, 0x00FF0000, 0xFF000000
+        );
+        if (icon_surf) {
+            SDL_SetWindowIcon(g_window, icon_surf);
+            SDL_FreeSurface(icon_surf);
+        }
+        stbi_image_free(icon_pixels);
+    }
     
     fprintf(stderr, "[SDL] Creating renderer...\n");
     /* 

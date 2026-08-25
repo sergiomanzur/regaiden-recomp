@@ -104,8 +104,14 @@ if(GBRECOMP_ENABLE_PERFORMANCE_COUNTERS)
     target_compile_definitions(gbrt PUBLIC GBRT_ENABLE_PERFORMANCE_COUNTERS)
 endif()
 
+set(RECOMP_EXTRA_SOURCES "")
+if(WIN32)
+    set(RECOMP_EXTRA_SOURCES icon.rc)
+endif()
+
 # Main executable
 add_executable(Resident_Evil_Gaiden__USA_
+    ${RECOMP_EXTRA_SOURCES}
     Resident_Evil_Gaiden__USA__main.c
     Resident_Evil_Gaiden__USA_.c
     rom_loader.c
