@@ -11,12 +11,13 @@ extern "C" {
 #endif
 
 typedef struct {
-    bool enabled;
-    bool auto_hide_on_controller;
-    bool controller_active;
-    int opacity_pct; // 0 to 100
-    bool haptic_feedback;
-    float scale;
+    bool enabled;                  // Master toggle for touch overlay
+    bool visible;                  // Dynamic show/hide state of on-screen gamepad
+    bool auto_hide_on_controller;  // Auto-hide when physical gamepad is active
+    bool controller_active;        // State tracking for physical controller
+    int opacity_pct;               // 10 to 100%
+    bool haptic_feedback;          // Vibration on touch
+    float scale;                   // Button scale multiplier (0.6x to 1.5x)
 } TouchOverlayConfig;
 
 extern TouchOverlayConfig g_touch_overlay_config;

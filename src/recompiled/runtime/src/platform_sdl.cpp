@@ -2641,6 +2641,7 @@ static void render_frame_internal(const uint32_t* framebuffer, bool count_guest_
                 ImGui::Text("Virtual Touch Controls (Android / Touchscreens):");
                 ImGui::Checkbox("Enable On-Screen Touch Controls", &g_touch_overlay_config.enabled);
                 if (g_touch_overlay_config.enabled) {
+                    ImGui::Checkbox("Show Virtual Gamepad (Toggle with Top-Left Icon)", &g_touch_overlay_config.visible);
                     ImGui::Checkbox("Auto-Hide when Physical Gamepad is Connected", &g_touch_overlay_config.auto_hide_on_controller);
                     ImGui::SliderInt("Touch Overlay Opacity (%)", &g_touch_overlay_config.opacity_pct, 10, 100);
                     ImGui::SliderFloat("Touch Button Scale", &g_touch_overlay_config.scale, 0.6f, 1.5f, "%.2fx");
