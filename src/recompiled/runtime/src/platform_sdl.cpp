@@ -40,6 +40,7 @@
 #include "lighting.h"
 #include "postprocess.h"
 #include "hd_pack.h"
+#include "touch_overlay.h"
 
 namespace fs = std::filesystem;
 
@@ -1450,8 +1451,8 @@ static void rebuild_manual_joypad_state_from_bindings(void) {
 
 static void update_effective_joypad_state(void) {
     rebuild_manual_joypad_state_from_bindings();
-    g_joypad_dpad = g_manual_joypad_dpad & g_script_joypad_dpad;
-    g_joypad_buttons = g_manual_joypad_buttons & g_script_joypad_buttons;
+    g_joypad_dpad = g_manual_joypad_dpad & g_script_joypad_dpad & touch_overlay_get_dpad_mask();
+    g_joypad_buttons = g_manual_joypad_buttons & g_script_joypad_buttons & touch_overlay_get_buttons_mask();
     lighting_update_player_dir(g_joypad_dpad);
 }
 
@@ -2346,6 +2347,9 @@ static void render_frame_internal(const uint32_t* framebuffer, bool count_guest_
         hd_pack_render_host_overlay(g_registered_ctx, g_renderer, g_game_viewport.x, g_game_viewport.y, g_game_viewport.w, g_game_viewport.h);
     }
 
+    /* Render virtual touch overlay controls (Android / Touchscreen) */
+    touch_overlay_render(g_renderer, g_windowed_width, g_windowed_height);
+
     ImGui_ImplSDLRenderer2_NewFrame();
     ImGui_ImplSDL2_NewFrame();
     ImGui::NewFrame();
@@ -2633,6 +2637,16 @@ static void render_frame_internal(const uint32_t* framebuffer, bool count_guest_
                     ImGui::TextDisabled("Waiting for input...");
                     if (ImGui::Button("Cancel Capture")) cancel_binding_capture();
                 }
+                ImGui::Separator();
+                ImGui::Text("Virtual Touch Controls (Android / Touchscreens):");
+                ImGui::Checkbox("Enable On-Screen Touch Controls", &g_touch_overlay_config.enabled);
+                if (g_touch_overlay_config.enabled) {
+                    ImGui::Checkbox("Auto-Hide when Physical Gamepad is Connected", &g_touch_overlay_config.auto_hide_on_controller);
+                    ImGui::SliderInt("Touch Overlay Opacity (%)", &g_touch_overlay_config.opacity_pct, 10, 100);
+                    ImGui::SliderFloat("Touch Button Scale", &g_touch_overlay_config.scale, 0.6f, 1.5f, "%.2fx");
+                    ImGui::Checkbox("Haptic Vibration on Touch", &g_touch_overlay_config.haptic_feedback);
+                }
+                ImGui::Spacing();
                 if (ImGui::Button("Reset Default Controls")) {
                     reset_runtime_control_defaults();
                 }
@@ -3512,6 +3526,12 @@ static bool handle_runtime_event(const SDL_Event* event, GBContext* ctx) {
     }
     if (handle_binding_capture_event(event)) {
         return true;
+    }
+
+    touch_overlay_handle_event(event, g_windowed_width, g_windowed_height);
+    if (touch_overlay_menu_requested()) {
+        g_show_menu = !g_show_menu;
+        touch_overlay_clear_menu_request();
     }
 
     switch (event->type) {

@@ -75,6 +75,7 @@ add_library(gbrt STATIC
     ${CMAKE_CURRENT_SOURCE_DIR}/lighting.c
     ${CMAKE_CURRENT_SOURCE_DIR}/postprocess.c
     ${CMAKE_CURRENT_SOURCE_DIR}/hd_pack.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/touch_overlay.c
 )
 
 # Vendored Dear ImGui subset
