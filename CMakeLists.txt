@@ -15,6 +15,7 @@ endif()
 
 if(WIN32)
     add_link_options(-Wl,/STACK:67108864)
+    set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 endif()
 
 # Include the recompiled game sources
