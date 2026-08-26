@@ -322,25 +322,27 @@ static uint16_t calc_sweep(Channel1* ch) {
     
     if (shift > 0) {
         uint16_t delta = new_freq >> shift;
-        if (sub) new_freq -= delta;
-        else     new_freq += delta;
+        if (sub) {
+            if (delta > new_freq) new_freq = 0;
+            else new_freq -= delta;
+        } else {
+            new_freq += delta;
+        }
     }
     return new_freq;
 }
 
 static void step_envelope(int* timer, int* volume, uint8_t env_reg) {
+    uint8_t period = env_reg & 0x07;
+    if (period == 0) return;
+
     if (*timer > 0) {
         (*timer)--;
         if (*timer == 0) {
-            uint8_t period = env_reg & 0x07;
-            if (period > 0) {
-                *timer = period;
-                bool up = (env_reg & 0x08) != 0;
-                if (up && *volume < 15) (*volume)++;
-                else if (!up && *volume > 0) (*volume)--;
-            } else {
-                *timer = 8; /* If period is 0, it acts like 8 for reload? Actually spec says 8 */
-            }
+            *timer = period;
+            bool up = (env_reg & 0x08) != 0;
+            if (up && *volume < 15) (*volume)++;
+            else if (!up && *volume > 0) (*volume)--;
         }
     }
 }
@@ -533,44 +535,37 @@ uint8_t gb_audio_read(GBContext* ctx, uint16_t addr) {
     if (!apu) return 0xFF;
 
     if (addr >= 0xFF30 && addr <= 0xFF3F) {
-        if (apu->ch3.enabled) {
-            /* On DMG, if channel 3 is enabled, reading Wave RAM returns the byte currently being accessed */
-            return apu->ch3.wave_ram[apu->ch3.wave_pos / 2];
-        }
         return apu->ch3.wave_ram[addr - 0xFF30];
     }
     
-    /* If audio is disabled via NR52 bit 7, most registers are 0xFF? 
-       Actually, on DMG they are mostly readable. Stick to mask behavior for now. */
-       
     switch (addr) {
         /* Channel 1 */
         case 0xFF10: return apu->ch1.nr10 | 0x80;
         case 0xFF11: return apu->ch1.nr11 | 0x3F;
         case 0xFF12: return apu->ch1.nr12;
         case 0xFF13: return 0xFF; /* Write only */
-        case 0xFF14: return apu->ch1.nr14 | 0xBF;
+        case 0xFF14: return (apu->ch1.nr14 & 0x40) | 0xBF;
         
         /* Channel 2 */
         case 0xFF15: return 0xFF; /* Not used */
         case 0xFF16: return apu->ch2.nr21 | 0x3F;
         case 0xFF17: return apu->ch2.nr22;
         case 0xFF18: return 0xFF; /* Write only */
-        case 0xFF19: return apu->ch2.nr24 | 0xBF;
+        case 0xFF19: return (apu->ch2.nr24 & 0x40) | 0xBF;
         
         /* Channel 3 */
-        case 0xFF1A: return apu->ch3.nr30 | 0x7F;
+        case 0xFF1A: return (apu->ch3.nr30 & 0x80) | 0x7F;
         case 0xFF1B: return 0xFF; /* Write only */
-        case 0xFF1C: return apu->ch3.nr32 | 0x9F;
+        case 0xFF1C: return (apu->ch3.nr32 & 0x60) | 0x9F;
         case 0xFF1D: return 0xFF; /* Write only */
-        case 0xFF1E: return apu->ch3.nr34 | 0xBF;
+        case 0xFF1E: return (apu->ch3.nr34 & 0x40) | 0xBF;
         
         /* Channel 4 */
         case 0xFF1F: return 0xFF; /* Not used */
-        case 0xFF20: return apu->ch4.nr41 | 0xFF;
+        case 0xFF20: return 0xFF; /* Write only */
         case 0xFF21: return apu->ch4.nr42;
         case 0xFF22: return apu->ch4.nr43;
-        case 0xFF23: return apu->ch4.nr44 | 0xBF;
+        case 0xFF23: return (apu->ch4.nr44 & 0x40) | 0xBF;
         
         /* Control */
         case 0xFF24: return apu->nr50;
@@ -579,7 +574,8 @@ uint8_t gb_audio_read(GBContext* ctx, uint16_t addr) {
             /* NR52 - Power Status */
             /* Bit 7: Power ON/OFF (Read/Write) */
             /* Bits 0-3: Channel ON status (Read Only) */
-            uint8_t val = (apu->nr52 & 0x80) | 0x70;
+            if (!(apu->nr52 & 0x80)) return 0x70;
+            uint8_t val = 0xF0;
             if (apu->ch1.enabled) val |= 0x01;
             if (apu->ch2.enabled) val |= 0x02;
             if (apu->ch3.enabled) val |= 0x04;
@@ -601,16 +597,8 @@ void gb_audio_write(GBContext* ctx, uint16_t addr, uint8_t value) {
             ctx ? ctx->cycles : 0, addr, audio_reg_name(addr), value);
     }
     
-    /* If APU disabled (NR52 bit 7 off), write to registers ignored unless it's NR52 or Wave RAM */
-    bool power_on = (apu->nr52 & 0x80) != 0;
-
     if (addr >= 0xFF30 && addr <= 0xFF3F) {
-        /* If channel 3 is enabled, writes to Wave RAM are ignored (or weird on DMG).
-         * For simplicity/safety, we block writes if enabled.
-         */
-        if (!apu->ch3.enabled) {
-            apu->ch3.wave_ram[addr - 0xFF30] = value;
-        }
+        apu->ch3.wave_ram[addr - 0xFF30] = value;
         return;
     }
     
@@ -620,13 +608,17 @@ void gb_audio_write(GBContext* ctx, uint16_t addr, uint8_t value) {
         bool power_enable = (value & 0x80) != 0;
         apu->nr52 = (apu->nr52 & 0x0F) | (value & 0x80); /* Keep status bits, update power bit */
         if (!power_enable) {
-            /* Power off: clear all registers */
+            /* Power off: clear all sound registers, disable channels, preserve Wave RAM */
+            uint8_t saved_wave[16];
+            memcpy(saved_wave, apu->ch3.wave_ram, sizeof(saved_wave));
             memset(&apu->ch1, 0, sizeof(Channel1));
             memset(&apu->ch2, 0, sizeof(Channel2));
             memset(&apu->ch3, 0, sizeof(Channel3));
             memset(&apu->ch4, 0, sizeof(Channel4));
+            memcpy(apu->ch3.wave_ram, saved_wave, sizeof(saved_wave));
             apu->nr50 = 0;
             apu->nr51 = 0;
+            apu->nr52 = 0;
             audio_reset_timing_state(apu);
         } else if (!was_powered) {
             audio_reset_timing_state(apu);
@@ -635,7 +627,8 @@ void gb_audio_write(GBContext* ctx, uint16_t addr, uint8_t value) {
         return;
     }
     
-    if (!power_on && addr != 0xFF26 && !(addr >= 0xFF30 && addr <= 0xFF3F)) {
+    bool power_on = (apu->nr52 & 0x80) != 0;
+    if (!power_on) {
         return;
     }
     
@@ -846,7 +839,7 @@ static void audio_emit_sample(GBContext* ctx, GBAudio* apu) {
     int ch3_mix = 0;
     int ch4_mix = 0;
 
-    if (apu->ch1.enabled && (apu->ch1.nr12 & 0xF0)) {
+    if (apu->ch1.enabled && (apu->ch1.nr12 & 0xF8)) {
         int duty = (apu->ch1.nr11 >> 6) & 3;
         int output = DUTY_CYCLES[duty][apu->ch1.wave_pos] ? 1 : -1;
         ch1_mix = apu->ch1.volume * output;
@@ -854,7 +847,7 @@ static void audio_emit_sample(GBContext* ctx, GBAudio* apu) {
         if (apu->nr51 & 0x10) left += ch1_mix;
     }
 
-    if (apu->ch2.enabled && (apu->ch2.nr22 & 0xF0)) {
+    if (apu->ch2.enabled && (apu->ch2.nr22 & 0xF8)) {
         int duty = (apu->ch2.nr21 >> 6) & 3;
         int output = DUTY_CYCLES[duty][apu->ch2.wave_pos] ? 1 : -1;
         ch2_mix = apu->ch2.volume * output;
@@ -876,7 +869,7 @@ static void audio_emit_sample(GBContext* ctx, GBAudio* apu) {
         if (apu->nr51 & 0x40) left += ch3_mix;
     }
 
-    if (apu->ch4.enabled && (apu->ch4.nr42 & 0xF0)) {
+    if (apu->ch4.enabled && (apu->ch4.nr42 & 0xF8)) {
         int output = !(apu->ch4.lfsr & 1) ? 1 : -1;
         ch4_mix = apu->ch4.volume * output;
         if (apu->nr51 & 0x08) right += ch4_mix;

@@ -2,6 +2,23 @@
 
 All notable changes to **Resident Evil Gaiden Recompiled** will be documented in this file.
 
+## [v0.2.1] - 2026-08-26
+
+### Audio & APU Emulation Fixes (Windows & Android)
+- **Preserved Wave RAM Across APU Power Off Cycles**:
+  - Prevented APU power-down routines (`NR52` bit 7 = 0) from clearing Channel 3 Wave RAM (`0xFF30`-`0xFF3F`), matching Game Boy hardware behavior. Fixes room ambient tracks, synth basslines, and SFX wave instruments becoming permanently silenced or corrupted after fight screens, room transitions, or sound driver resets.
+- **Fixed Game Boy Color Wave RAM Write Dropping**:
+  - Allowed continuous CPU write access to Wave RAM regardless of Channel 3 playback state, in accordance with CGB hardware specifications. Eliminates dropped waveform updates during battle sound effects, item pickups, and music instrument swaps.
+- **Fixed Hardware-Accurate Sound Register Read Masks**:
+  - Corrected `NR14`, `NR24`, `NR34`, `NR44` read masking (`0xBF` with bit 6) so that write-only trigger bit 7 does not falsely read as 1. Fixes sound driver length-counter misdetections where looping music tracks were prematurely stopped or tracks overlapped incorrectly.
+  - Corrected `NR30`, `NR32`, `NR41`, and `NR52` power/channel status bit masking.
+- **Fixed DAC Enable & Volume Envelope Mixing**:
+  - Changed channel mixing DAC checks from initial envelope volume (`NRx2 & 0xF0`) to DAC power status (`NRx2 & 0xF8`). Fixes notes with initial volume 0 and upward volume sweeps (fades/swells) being muted.
+- **Fixed Channel 1 Sweep Subtraction Underflow**:
+  - Clamped downward frequency sweep calculations to 0 on underflow instead of overflowing `uint16_t` to 65535, preventing false sweep overflow disables.
+- **Audio Batch Publication on VSync**:
+  - Flushed pending audio sample batches at each 60 FPS frame boundary (`gb_platform_vsync`), minimizing audio buffer jitter.
+
 ## [v0.2.0] - 2026-08-25
 
 ### Native Android Port & Handheld Gaming Support
