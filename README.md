@@ -1,14 +1,14 @@
 # Resident Evil Gaiden: Recompiled (PC / Native)
 
-[![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux%20(WIP)%20%7C%20Android%20(WIP)-blue.svg)]()
+[![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Android%20(ARM64)%20%7C%20Linux%20(WIP)-blue.svg)]()
 [![C++](https://img.shields.io/badge/Language-C11%20%2F%20C%2B%2B20-orange.svg)]()
-[![Backend](https://img.shields.io/badge/Graphics-SDL2%20%7C%20Dear%20ImGui-green.svg)]()
-[![Release](https://img.shields.io/badge/Release-v0.1b-red.svg)]()
+[![Backend](https://img.shields.io/badge/Graphics-SDL2%20%7C%20Dear%20ImGui%20%7C%20GLES3-green.svg)]()
+[![Release](https://img.shields.io/badge/Release-v0.2.0-red.svg)]()
 [![License](https://img.shields.io/badge/License-MIT-purple.svg)]()
 
-A native static recompilation of **Resident Evil Gaiden** (Game Boy Color, 2001) for modern PC platforms, built in C/C++ with hardware-accelerated SDL2 and Dear ImGui.
+A native static recompilation of **Resident Evil Gaiden** (Game Boy Color, 2001) for modern PC and Android platforms, built in C/C++ with hardware-accelerated SDL2, OpenGLES 3, and Dear ImGui.
 
-Running directly on native hardware without CPU emulation overhead, this project modernizes the classic maritime survival horror experience with **True Widescreen**, **Dynamic 2D Flashlight Lighting**, **Atmospheric Horror Shaders**, and an **HD Texture Pack Engine**.
+Running directly on native hardware without CPU emulation overhead, this project modernizes the classic maritime survival horror experience with **True Widescreen**, **Dynamic 2D Flashlight Lighting**, **Atmospheric Horror Shaders**, **Touch Controls**, and an **HD Texture Pack Engine**.
 
 ---
 
@@ -52,17 +52,19 @@ Running directly on native hardware without CPU emulation overhead, this project
 - **10 Dedicated Savestate Slots**: Save and load instantly via the in-game overlay menu or shortcut keys (`F5` Save, `F7` Load, `F6`/`F8` Slot change).
 - Automatic battery-backed SRAM persistence for native in-game typewriter save points.
 
-### 7. Modern Controller & Keyboard Mapping
-- Full support for **XInput (Xbox)**, **PlayStation (DualShock / DualSense)**, and **generic USB gamepads**.
+### 7. Modern Controller, Keyboard & Mobile Touch Controls
+- Full support for **XInput (Xbox)**, **PlayStation (DualShock / DualSense)**, **Retroid Pocket**, and **generic USB gamepads**.
+- **Android Virtual Touch Gamepad**: On-screen D-Pad, action buttons, quick settings button, and controller show/hide toggle.
+- **Portrait & Landscape Adaptive Layouts** with in-game orientation locking.
 - Live in-game rebinding interface with analog stick support and rumble-ready architecture.
 
 ---
 
 ## Platform Availability & Roadmap
 
-- [x] **Windows (x86_64)**: Fully supported and available now (**Release v0.1b**).
+- [x] **Windows (x86_64)**: Fully supported with static CRT, embedded icon, and release archive (**Release v0.2.0**).
+- [x] **Android (ARM64-v8a)**: Fully supported with touch gamepad, Retroid Pocket optimization, and legal ROM onboarding (**Release v0.2.0**).
 - [ ] **Linux (x86_64 / ARM64)**: Native SDL2 + Vulkan build in active preparation.
-- [ ] **Android**: Dedicated port with on-screen virtual controls and touch navigation in active preparation.
 
 ---
 
@@ -112,13 +114,19 @@ Running directly on native hardware without CPU emulation overhead, this project
 git clone https://github.com/sergiomanzur/regaiden-recomp.git
 cd regaiden-recomp
 
-# Configure and build with CMake & Ninja
-cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-ninja -C build
-
-# Run the compiled binary
-.\bin\Resident_Evil_Gaiden__USA_.exe
+# Build with static CRT and package Windows release
+.\scripts\package_release.ps1 -Version "0.2.0" -SkipAndroid
 ```
+
+### Build on Android (APK)
+```powershell
+# Navigate to Android directory
+cd android
+
+# Compile ARM64-v8a debug APK
+.\gradlew assembleDebug
+```
+The resulting APK is generated at `android/app/build/outputs/apk/debug/app-debug.apk`.
 
 ---
 
@@ -129,9 +137,10 @@ This repository contains **only clean-room reverse-engineered recompilation sour
 To play, provide a legally acquired ROM dump of:
 - **Title**: *Resident Evil Gaiden (USA)*
 - **Format**: `.gbc`
-- **Expected SHA256**: `664971c26b42b93fc72545d94bc6572eb0f171018ceef5285743b1712a7a40c6`
+- **Expected Size**: `2,097,152 bytes`
+- **Expected SHA256**: `9a97678cbd8da02c8763e977674e17f460c06ea8b73bad35c52fe6817f506d44`
 
-Place `Resident Evil Gaiden (USA).gbc` in the root directory or load it via the in-game ROM selector upon initial startup.
+Place `Resident Evil Gaiden (USA).gbc` in the root directory (Windows) or select it via the in-game ROM setup picker on first launch (Android / Windows).
 
 ---
 

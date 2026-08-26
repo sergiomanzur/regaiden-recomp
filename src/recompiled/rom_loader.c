@@ -9,21 +9,52 @@
 #include <commdlg.h>
 #endif
 
+#ifdef GB_HAS_SDL2
+#include <SDL.h>
+#endif
+
 uint8_t* g_rom_data = NULL;
 size_t g_rom_size = 0;
 
 static const char* s_candidate_paths[] = {
     "Resident Evil Gaiden (USA).gbc",
+    "rom.gbc",
     "rom/Resident Evil Gaiden (USA).gbc",
     "../rom/Resident Evil Gaiden (USA).gbc",
     "../../rom/Resident Evil Gaiden (USA).gbc",
-    "rom.gbc",
     "Resident_Evil_Gaiden__USA_.gbc",
+    "/sdcard/ROMs/GBC/Resident Evil Gaiden (USA).gbc",
+    "/sdcard/Roms/GBC/Resident Evil Gaiden (USA).gbc",
+    "/sdcard/ROMs/GBC/rom.gbc",
+    "/sdcard/Download/Resident Evil Gaiden (USA).gbc",
+    "/sdcard/Resident Evil Gaiden (USA).gbc",
     NULL
 };
 
 static uint8_t* read_file_bytes(const char* path, size_t* out_size) {
     if (!path || !out_size) return NULL;
+#ifdef GB_HAS_SDL2
+    SDL_RWops* rw = SDL_RWFromFile(path, "rb");
+    if (rw) {
+        Sint64 sz = SDL_RWsize(rw);
+        if (sz > 0 && sz <= 32 * 1024 * 1024) {
+            uint8_t* buf = (uint8_t*)malloc((size_t)sz);
+            if (buf) {
+                size_t read_bytes = SDL_RWread(rw, buf, 1, (size_t)sz);
+                SDL_RWclose(rw);
+                if (read_bytes == (size_t)sz) {
+                    *out_size = (size_t)sz;
+                    return buf;
+                }
+                free(buf);
+            } else {
+                SDL_RWclose(rw);
+            }
+        } else {
+            SDL_RWclose(rw);
+        }
+    }
+#endif
     FILE* f = fopen(path, "rb");
     if (!f) return NULL;
 
@@ -140,13 +171,32 @@ bool rom_loader_acquire_rom(const char* explicit_path) {
     }
 
     // 2. Search default candidate paths
+#if defined(__ANDROID__)
+    const char* internal_dir = SDL_AndroidGetInternalStoragePath();
+    if (internal_dir && internal_dir[0]) {
+        char full_path[512];
+        snprintf(full_path, sizeof(full_path), "%s/Resident Evil Gaiden (USA).gbc", internal_dir);
+        if (validate_and_load(full_path)) return true;
+        snprintf(full_path, sizeof(full_path), "%s/rom.gbc", internal_dir);
+        if (validate_and_load(full_path)) return true;
+    }
+    const char* external_dir = SDL_AndroidGetExternalStoragePath();
+    if (external_dir && external_dir[0]) {
+        char full_path[512];
+        snprintf(full_path, sizeof(full_path), "%s/Resident Evil Gaiden (USA).gbc", external_dir);
+        if (validate_and_load(full_path)) return true;
+        snprintf(full_path, sizeof(full_path), "%s/rom.gbc", external_dir);
+        if (validate_and_load(full_path)) return true;
+    }
+#endif
     for (int i = 0; s_candidate_paths[i] != NULL; ++i) {
         if (validate_and_load(s_candidate_paths[i])) {
             return true;
         }
     }
 
-    // 3. Prompt the user via GUI file dialog or interactive prompt
+#ifdef _WIN32
+    // 3. Prompt the user via GUI file dialog on Windows
     printf("\n===================================================================\n");
     printf("  Resident Evil Gaiden (GBC) - ROM Required\n");
     printf("===================================================================\n");
@@ -155,7 +205,6 @@ bool rom_loader_acquire_rom(const char* explicit_path) {
     printf("  Expected SHA256: %s\n", RE_GAIDEN_EXPECTED_SHA256);
     printf("===================================================================\n\n");
 
-#ifdef _WIN32
     char picked_path[MAX_PATH] = "";
     while (prompt_user_for_rom_win32(picked_path, sizeof(picked_path))) {
         if (validate_and_load(picked_path)) {
@@ -170,6 +219,20 @@ bool rom_loader_acquire_rom(const char* explicit_path) {
                 "Invalid ROM Image",
                 MB_OK | MB_ICONERROR);
         }
+    }
+#elif defined(__ANDROID__)
+    // 3. On Android, wait for the user to select the ROM via the Java UI picker
+    printf("[ROM Loader] No initial ROM found. Waiting for user to select ROM via Android picker dialog...\n");
+    for (int retry = 0; retry < 600; ++retry) { // wait up to 2 minutes
+        const char* internal_dir = SDL_AndroidGetInternalStoragePath();
+        if (internal_dir && internal_dir[0]) {
+            char full_path[512];
+            snprintf(full_path, sizeof(full_path), "%s/Resident Evil Gaiden (USA).gbc", internal_dir);
+            if (validate_and_load(full_path)) return true;
+            snprintf(full_path, sizeof(full_path), "%s/rom.gbc", internal_dir);
+            if (validate_and_load(full_path)) return true;
+        }
+        SDL_Delay(200);
     }
 #endif
 

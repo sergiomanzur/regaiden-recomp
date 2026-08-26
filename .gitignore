@@ -32,3 +32,14 @@ imgui.ini
 release/
 src/recompiled/*metadata.json
 *.json
+
+# Android build artifacts
+android/.gradle/
+android/local.properties
+android/app/build/
+android/app/.cxx/
+android/.idea/
+android/captures/
+android/.externalNativeBuild/
+android/app/*.apk
+

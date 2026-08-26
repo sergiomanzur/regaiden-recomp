@@ -2,7 +2,7 @@
 # Packages Windows (.zip) and Android (.apk / .zip) independently for GitHub Releases.
 
 param(
-    [string]$Version = "0.1b",
+    [string]$Version = "0.2.0",
     [switch]$SkipAndroid = $false,
     [switch]$SkipWindows = $false
 )
@@ -45,8 +45,11 @@ if (-not $SkipWindows) {
     Copy-Item "$RootDir/deps/SDL2-2.30.12/lib/x64/SDL2.dll" $WinPkgDir -Force
     Copy-Item "$RootDir/config.ini" $WinPkgDir -Force
     Copy-Item "$RootDir/README.md" $WinPkgDir -Force
+    Copy-Item "$RootDir/CHANGELOG.md" $WinPkgDir -Force
     Copy-Item "$RootDir/LICENSE" $WinPkgDir -Force
-    Copy-Item -Recurse "$RootDir/hd_pack" $WinPkgDir -Force
+    if (Test-Path "$RootDir/hd_pack") {
+        Copy-Item -Recurse "$RootDir/hd_pack" $WinPkgDir -Force
+    }
     
     $WinZip = Join-Path $ReleaseDir "Resident_Evil_Gaiden_Recomp_v${Version}_Windows.zip"
     if (Test-Path $WinZip) { Remove-Item -Force $WinZip }
@@ -59,12 +62,45 @@ if (-not $SkipWindows) {
 # 2. Build Android Release Package (APK)
 # ---------------------------------------------------------
 if (-not $SkipAndroid) {
-    Write-Host "`n[Android] Checking Android build environment..." -ForegroundColor Yellow
+    Write-Host "`n[Android] Building Android APK (ARM64-v8a)..." -ForegroundColor Yellow
     $AndroidDir = Join-Path $RootDir "android"
     
     if (Test-Path $AndroidDir) {
-        Write-Host "[Android] Android project scaffold ready at: $AndroidDir" -ForegroundColor Green
-        Write-Host "[Android] Artifact: Resident_Evil_Gaiden_Recomp_v${Version}_Android.apk" -ForegroundColor Green
+        if (Test-Path "C:\Program Files\JetBrains\PyCharm 2025.2.4\jbr") {
+            $env:JAVA_HOME = "C:\Program Files\JetBrains\PyCharm 2025.2.4\jbr"
+        } elseif (Test-Path "C:\Program Files\Android\Android Studio\jbr") {
+            $env:JAVA_HOME = "C:\Program Files\Android\Android Studio\jbr"
+        }
+        $env:PATH = "$env:JAVA_HOME\bin;$env:PATH"
+        Push-Location $AndroidDir
+        try {
+            .\gradlew assembleDebug
+        } finally {
+            Pop-Location
+        }
+        
+        $BuiltApk = Join-Path $AndroidDir "app/build/outputs/apk/debug/app-debug.apk"
+        if (Test-Path $BuiltApk) {
+            $OutApk = Join-Path $ReleaseDir "Resident_Evil_Gaiden_Recomp_v${Version}_Android.apk"
+            Copy-Item $BuiltApk $OutApk -Force
+            
+            $AndroidPkgDir = Join-Path $ReleaseDir "Resident_Evil_Gaiden_Recomp_v${Version}_Android"
+            if (Test-Path $AndroidPkgDir) { Remove-Item -Recurse -Force $AndroidPkgDir }
+            New-Item -ItemType Directory -Path $AndroidPkgDir | Out-Null
+            Copy-Item $OutApk $AndroidPkgDir -Force
+            Copy-Item "$RootDir/README.md" $AndroidPkgDir -Force
+            Copy-Item "$RootDir/CHANGELOG.md" $AndroidPkgDir -Force
+            Copy-Item "$RootDir/LICENSE" $AndroidPkgDir -Force
+            
+            $AndroidZip = Join-Path $ReleaseDir "Resident_Evil_Gaiden_Recomp_v${Version}_Android.zip"
+            if (Test-Path $AndroidZip) { Remove-Item -Force $AndroidZip }
+            Compress-Archive -Path "$AndroidPkgDir/*" -DestinationPath $AndroidZip -Force
+            
+            Write-Host "[Android] Successfully generated: $OutApk" -ForegroundColor Green
+            Write-Host "[Android] Successfully generated: $AndroidZip" -ForegroundColor Green
+        } else {
+            Write-Warning "[Android] APK not found at $BuiltApk"
+        }
     }
 }
 

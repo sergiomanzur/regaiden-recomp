@@ -62,8 +62,26 @@ static bool load_texture_file(const char* filepath, const char* name, SDL_Render
         return false;
     }
 
-    int w, h, channels;
-    unsigned char* data = stbi_load(filepath, &w, &h, &channels, 4);
+    int w = 0, h = 0, channels = 0;
+    unsigned char* data = NULL;
+
+    SDL_RWops* rw = SDL_RWFromFile(filepath, "rb");
+    if (rw) {
+        Sint64 sz = SDL_RWsize(rw);
+        if (sz > 0 && sz <= 32 * 1024 * 1024) {
+            unsigned char* raw = (unsigned char*)malloc((size_t)sz);
+            if (raw) {
+                if (SDL_RWread(rw, raw, 1, (size_t)sz) == (size_t)sz) {
+                    data = stbi_load_from_memory(raw, (int)sz, &w, &h, &channels, 4);
+                }
+                free(raw);
+            }
+        }
+        SDL_RWclose(rw);
+    }
+    if (!data) {
+        data = stbi_load(filepath, &w, &h, &channels, 4);
+    }
     if (!data) {
         return false;
     }
@@ -213,6 +231,17 @@ void hd_pack_init(const char* base_dir) {
     hd_pack_reload(NULL);
 }
 
+static const char* s_known_textures[] = {
+    "backgrounds/battle.png",
+    "backgrounds/battle_0.png",
+    "monsters/monster.png",
+    "monsters/zombie_0.png",
+    "portraits/barry.png",
+    "portraits/leon.png",
+    "portraits/lucia.png",
+    NULL
+};
+
 void hd_pack_reload(void* sdl_renderer) {
     if (sdl_renderer) {
         s_active_renderer = (SDL_Renderer*)sdl_renderer;
@@ -221,6 +250,15 @@ void hd_pack_reload(void* sdl_renderer) {
     scan_and_load_folder(g_hd_pack_config.pack_dir, "backgrounds", s_active_renderer);
     scan_and_load_folder(g_hd_pack_config.pack_dir, "monsters", s_active_renderer);
     scan_and_load_folder(g_hd_pack_config.pack_dir, "portraits", s_active_renderer);
+
+    if (s_texture_count == 0) {
+        for (int i = 0; s_known_textures[i] != NULL; ++i) {
+            char fullpath[512];
+            snprintf(fullpath, sizeof(fullpath), "%s/%s", g_hd_pack_config.pack_dir, s_known_textures[i]);
+            load_texture_file(fullpath, s_known_textures[i], s_active_renderer);
+        }
+    }
+
     printf("[HD Pack] Total HD textures loaded: %d (Folder: %s)\n", s_texture_count, g_hd_pack_config.pack_dir);
 }
 

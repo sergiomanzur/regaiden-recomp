@@ -22,6 +22,10 @@
 #if defined(_WIN32)
 #include <io.h>
 #include <windows.h>
+#elif defined(__ANDROID__)
+#include <jni.h>
+#include <fcntl.h>
+#include <unistd.h>
 #else
 #include <fcntl.h>
 #include <unistd.h>
@@ -2368,7 +2372,12 @@ static void render_frame_internal(const uint32_t* framebuffer, bool count_guest_
     }
 
     /* Render virtual touch overlay controls (Android / Touchscreen) */
-    touch_overlay_render(g_renderer, g_windowed_width, g_windowed_height);
+    int render_output_w = g_windowed_width;
+    int render_output_h = g_windowed_height;
+    if (g_renderer) {
+        SDL_GetRendererOutputSize(g_renderer, &render_output_w, &render_output_h);
+    }
+    touch_overlay_render(g_renderer, render_output_w, render_output_h);
 
     ImGui_ImplSDLRenderer2_NewFrame();
     ImGui_ImplSDL2_NewFrame();
@@ -2388,7 +2397,9 @@ static void render_frame_internal(const uint32_t* framebuffer, bool count_guest_
         ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(18.0f * ui_scale, 16.0f * ui_scale));
         ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(14.0f * ui_scale, 10.0f * ui_scale));
         ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(10.0f * ui_scale, 10.0f * ui_scale));
-        ImGui::PushStyleVar(ImGuiStyleVar_ScrollbarSize, 18.0f * ui_scale);
+        ImGui::PushStyleVar(ImGuiStyleVar_ScrollbarSize, 28.0f * ui_scale);
+        ImGui::PushStyleVar(ImGuiStyleVar_ScrollbarRounding, 8.0f * ui_scale);
+        ImGui::PushStyleVar(ImGuiStyleVar_GrabMinSize, 36.0f * ui_scale);
         ImGui::Begin("Resident Evil Gaiden",
                      &g_show_menu,
                      ImGuiWindowFlags_NoDecoration |
@@ -2404,11 +2415,10 @@ static void render_frame_internal(const uint32_t* framebuffer, bool count_guest_
         }
         ImGui::Separator();
 
-        ImGui::BeginChild("SettingsScroll", ImVec2(0.0f, -footer_height), false);
-
-        if (ImGui::BeginTabBar("MainTabs", ImGuiTabBarFlags_None)) {
+        if (ImGui::BeginTabBar("MainTabs", ImGuiTabBarFlags_FittingPolicyScroll | ImGuiTabBarFlags_TabListPopupButton)) {
             // Tab 1: ROM & Savestates
             if (ImGui::BeginTabItem("ROM & Saves")) {
+                ImGui::BeginChild("TabScroll_ROM", ImVec2(0.0f, -footer_height), false, ImGuiWindowFlags_AlwaysVerticalScrollbar);
                 ImGui::Spacing();
                 ImGui::Text("Loaded Game: Resident Evil Gaiden (USA)");
                 ImGui::TextDisabled("Expected SHA256: %s", RE_GAIDEN_EXPECTED_SHA256);
@@ -2420,6 +2430,20 @@ static void render_frame_internal(const uint32_t* framebuffer, bool count_guest_
                             gb_context_load_rom(g_registered_ctx, g_rom_data, g_rom_size);
                             g_registered_ctx->mbc_type = g_rom_data[0x147];
                             gb_context_reset(g_registered_ctx, true);
+                        }
+                    }
+                }
+#elif defined(__ANDROID__)
+                if (ImGui::Button("Select / Change ROM Image...", ImVec2(280.0f * ui_scale, 36.0f * ui_scale))) {
+                    JNIEnv* jenv = (JNIEnv*)SDL_AndroidGetJNIEnv();
+                    if (jenv) {
+                        jclass act_class = jenv->FindClass("com/capcom/regaiden/GameActivity");
+                        if (act_class) {
+                            jmethodID method = jenv->GetStaticMethodID(act_class, "requestRomPickerFromNative", "()V");
+                            if (method) {
+                                jenv->CallStaticVoidMethod(act_class, method);
+                            }
+                            jenv->DeleteLocalRef(act_class);
                         }
                     }
                 }
@@ -2447,11 +2471,13 @@ static void render_frame_internal(const uint32_t* framebuffer, bool count_guest_
                     }
                     ImGui::PopID();
                 }
+                ImGui::EndChild();
                 ImGui::EndTabItem();
             }
 
             // Tab 2: Display & Widescreen
             if (ImGui::BeginTabItem("Display & Widescreen")) {
+                ImGui::BeginChild("TabScroll_Display", ImVec2(0.0f, -footer_height), false, ImGuiWindowFlags_AlwaysVerticalScrollbar);
                 ImGui::Spacing();
                 const char* aspect_names[] = {
                     "Native 10:9 (160x144)",
@@ -2514,11 +2540,13 @@ static void render_frame_internal(const uint32_t* framebuffer, bool count_guest_
                     g_app_config.vsync = g_vsync;
                     config_save_ini(NULL);
                 }
+                ImGui::EndChild();
                 ImGui::EndTabItem();
             }
 
             // Tab 3: Lighting & Shaders
             if (ImGui::BeginTabItem("Lighting & Shaders")) {
+                ImGui::BeginChild("TabScroll_Lighting", ImVec2(0.0f, -footer_height), false, ImGuiWindowFlags_AlwaysVerticalScrollbar);
                 ImGui::Spacing();
                 ImGui::TextDisabled("Dynamic Flashlight & Lighting (2D Exploration):");
                 if (ImGui::Checkbox("Enable Flashlight Cone", &g_lighting_config.enabled)) {
@@ -2601,11 +2629,13 @@ static void render_frame_internal(const uint32_t* framebuffer, bool count_guest_
                     g_app_config.color_grade_mode = grade_idx;
                     config_save_ini(NULL);
                 }
+                ImGui::EndChild();
                 ImGui::EndTabItem();
             }
 
             // Tab 4: HD Pack & Mods
             if (ImGui::BeginTabItem("HD Pack & Mods")) {
+                ImGui::BeginChild("TabScroll_HDPack", ImVec2(0.0f, -footer_height), false, ImGuiWindowFlags_AlwaysVerticalScrollbar);
                 ImGui::Spacing();
                 ImGui::Text("HD PNG Texture Pack System:");
                 ImGui::Separator();
@@ -2646,11 +2676,13 @@ static void render_frame_internal(const uint32_t* framebuffer, bool count_guest_
                         ImGui::PopID();
                     }
                 }
+                ImGui::EndChild();
                 ImGui::EndTabItem();
             }
 
             // Tab 5: Controls & Mapping
             if (ImGui::BeginTabItem("Controls & Mapping")) {
+                ImGui::BeginChild("TabScroll_Controls", ImVec2(0.0f, -footer_height), false, ImGuiWindowFlags_AlwaysVerticalScrollbar);
                 ImGui::Spacing();
                 if (!g_controller_name.empty()) {
                     ImGui::Text("Detected Gamepad: %s (%s)", g_controller_name.c_str(), controller_type_name(g_controller_type));
@@ -2680,11 +2712,13 @@ static void render_frame_internal(const uint32_t* framebuffer, bool count_guest_
                 if (ImGui::Button("Reset Default Controls")) {
                     reset_runtime_control_defaults();
                 }
+                ImGui::EndChild();
                 ImGui::EndTabItem();
             }
 
-            // Tab 4: Cheats
+            // Tab 6: Cheats
             if (ImGui::BeginTabItem("Cheats")) {
+                ImGui::BeginChild("TabScroll_Cheats", ImVec2(0.0f, -footer_height), false, ImGuiWindowFlags_AlwaysVerticalScrollbar);
                 ImGui::Spacing();
                 ImGui::Text("Resident Evil Gaiden Built-in Cheats:");
                 ImGui::Separator();
@@ -2716,11 +2750,13 @@ static void render_frame_internal(const uint32_t* framebuffer, bool count_guest_
                     }
                     ImGui::PopID();
                 }
+                ImGui::EndChild();
                 ImGui::EndTabItem();
             }
 
-            // Tab 5: Audio
+            // Tab 7: Audio
             if (ImGui::BeginTabItem("Audio")) {
+                ImGui::BeginChild("TabScroll_Audio", ImVec2(0.0f, -footer_height), false, ImGuiWindowFlags_AlwaysVerticalScrollbar);
                 ImGui::Spacing();
                 if (ImGui::Checkbox("Enable Audio Output", &g_audio_output_enabled)) {
                     reset_audio_output_buffer(true);
@@ -2762,11 +2798,13 @@ static void render_frame_internal(const uint32_t* framebuffer, bool count_guest_
                     reset_audio_output_buffer(true);
                     config_save_ini(NULL);
                 }
+                ImGui::EndChild();
                 ImGui::EndTabItem();
             }
 
-            // Tab 6: Config & INI
+            // Tab 8: Config & INI
             if (ImGui::BeginTabItem("Config & INI")) {
+                ImGui::BeginChild("TabScroll_Config", ImVec2(0.0f, -footer_height), false, ImGuiWindowFlags_AlwaysVerticalScrollbar);
                 ImGui::Spacing();
                 ImGui::Text("Active configuration file: config.ini");
                 ImGui::Spacing();
@@ -2780,13 +2818,12 @@ static void render_frame_internal(const uint32_t* framebuffer, bool count_guest_
                     config_set_defaults(&g_app_config);
                     config_save_ini(NULL);
                 }
+                ImGui::EndChild();
                 ImGui::EndTabItem();
             }
 
             ImGui::EndTabBar();
         }
-
-        ImGui::EndChild();
         ImGui::Separator();
 
         const float footer_button_width = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x) / 2.0f;
@@ -2801,7 +2838,7 @@ static void render_frame_internal(const uint32_t* framebuffer, bool count_guest_
             SDL_PushEvent(&quit_event);
         }
         ImGui::End();
-        ImGui::PopStyleVar(6);
+        ImGui::PopStyleVar(8);
     } else if (g_show_overlay) {
         ImGui::SetNextWindowPos(ImVec2(10, 10), ImGuiCond_Always);
         ImGui::SetNextWindowBgAlpha(0.35f);
@@ -3576,10 +3613,32 @@ static bool handle_runtime_event(const SDL_Event* event, GBContext* ctx) {
         return true;
     }
 
-    touch_overlay_handle_event(event, g_windowed_width, g_windowed_height);
+    int touch_event_w = g_windowed_width;
+    int touch_event_h = g_windowed_height;
+    if (g_renderer) {
+        SDL_GetRendererOutputSize(g_renderer, &touch_event_w, &touch_event_h);
+    } else if (g_window) {
+        SDL_GetWindowSize(g_window, &touch_event_w, &touch_event_h);
+    }
+    uint8_t touch_prev_dpad = g_joypad_dpad;
+    uint8_t touch_prev_buttons = g_joypad_buttons;
+    touch_overlay_handle_event(event, touch_event_w, touch_event_h);
     if (touch_overlay_menu_requested()) {
         g_show_menu = !g_show_menu;
         touch_overlay_clear_menu_request();
+    }
+    if (event->type == SDL_FINGERDOWN || event->type == SDL_FINGERUP || event->type == SDL_FINGERMOTION) {
+        if (g_show_menu && event->type == SDL_FINGERMOTION && ImGui::GetCurrentContext() != NULL) {
+            ImGuiIO& io = ImGui::GetIO();
+            float delta_x = event->tfinger.dx * (float)touch_event_w;
+            float delta_y = event->tfinger.dy * (float)touch_event_h;
+            io.AddMouseWheelEvent(delta_x / 30.0f, delta_y / 20.0f);
+        }
+        update_effective_joypad_state();
+        update_runtime_action_state(ctx);
+        if (ctx && input_transition_creates_press(touch_prev_dpad, touch_prev_buttons, g_joypad_dpad, g_joypad_buttons, dpad_selected, buttons_selected)) {
+            request_joypad_interrupt(ctx);
+        }
     }
 
     switch (event->type) {
@@ -3632,6 +3691,16 @@ static bool handle_runtime_event(const SDL_Event* event, GBContext* ctx) {
             break;
 
         case SDL_CONTROLLERAXISMOTION: {
+            if (g_show_menu && ImGui::GetCurrentContext() != NULL) {
+                ImGuiIO& io = ImGui::GetIO();
+                if (event->caxis.axis == SDL_CONTROLLER_AXIS_RIGHTY || event->caxis.axis == SDL_CONTROLLER_AXIS_LEFTY) {
+                    Sint16 val = event->caxis.value;
+                    if (abs(val) > 8000) {
+                        float scroll_y = -(float)val / 32767.0f * 0.8f;
+                        io.AddMouseWheelEvent(0.0f, scroll_y);
+                    }
+                }
+            }
             uint8_t previous_dpad = g_joypad_dpad;
             uint8_t previous_buttons = g_joypad_buttons;
 
@@ -3658,6 +3727,17 @@ static bool handle_runtime_event(const SDL_Event* event, GBContext* ctx) {
         case SDL_CONTROLLERBUTTONDOWN:
         case SDL_CONTROLLERBUTTONUP: {
             const bool pressed = (event->type == SDL_CONTROLLERBUTTONDOWN);
+            if (g_show_menu && pressed && ImGui::GetCurrentContext() != NULL) {
+                ImGuiIO& io = ImGui::GetIO();
+                if (event->cbutton.button == SDL_CONTROLLER_BUTTON_DPAD_UP) {
+                    io.AddMouseWheelEvent(0.0f, 2.5f);
+                } else if (event->cbutton.button == SDL_CONTROLLER_BUTTON_DPAD_DOWN) {
+                    io.AddMouseWheelEvent(0.0f, -2.5f);
+                } else if (event->cbutton.button == SDL_CONTROLLER_BUTTON_B || event->cbutton.button == SDL_CONTROLLER_BUTTON_BACK) {
+                    g_show_menu = false;
+                    return true;
+                }
+            }
             uint8_t previous_dpad = g_joypad_dpad;
             uint8_t previous_buttons = g_joypad_buttons;
 
