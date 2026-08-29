@@ -6,6 +6,8 @@
 #define STB_IMAGE_IMPLEMENTATION
 #include "hd_pack.h"
 #include "runtime/vendor/stb/stb_image.h"
+#include "widescreen_ppu.h"
+#include "game_state.h"
 
 #ifdef _WIN32
 #include <windows.h>
@@ -17,12 +19,33 @@
 
 #define MAX_HD_TEXTURES 64
 
+/*
+ * Dialogue-box geometry, in guest pixels.
+ *
+ * A Resident Evil Gaiden dialogue box occupies the lower part of the 144px
+ * screen. Menus drawn on the window layer start at the very top, so requiring
+ * the window to begin below HD_DIALOG_MIN_WY separates a dialogue box from a
+ * full-screen menu.
+ */
+#define HD_DIALOG_MIN_WY  72
+#define HD_DIALOG_MAX_WY 134
+#define HD_DIALOG_MARGIN   4
+#define HD_PORTRAIT_MIN   16
+#define HD_PORTRAIT_MAX   32
+
+/* Guest framebuffer width for the active aspect mode, for horizontal scaling. */
+static int hd_pack_guest_width(void) {
+    int w = widescreen_get_target_width();
+    return (w > 0) ? w : 160;
+}
+
 static HDTexture s_textures[MAX_HD_TEXTURES];
 static int s_texture_count = 0;
 static SDL_Renderer* s_active_renderer = NULL;
 
+// Opt-in enhancement: off until the player enables it (see config_set_defaults).
 HDPackConfig g_hd_pack_config = {
-    .enabled = true,
+    .enabled = false,
     .pack_dir = "hd_pack",
     .loaded_count = 0,
     .enable_hd_backgrounds = true,
@@ -311,25 +334,42 @@ void hd_pack_render_host_overlay(GBContext* ctx, void* sdl_renderer, int vp_x, i
         return;
     }
 
-    // 2. HD Character Dialog Portraits (ONLY when dialogue window is open on screen)
-    if (g_hd_pack_config.enable_hd_portraits && ctx->wram) {
-        // Window must be enabled with WY active on screen (WY < 144)
-        bool win_active = (ctx->io[0x40] & 0x20) && (ctx->io[0x4A] < 120);
-        if (win_active) {
-            uint8_t char_id = ctx->wram[0x0800]; // 0=Barry, 1=Leon, 2=Lucia
-            const HDTexture* portrait = NULL;
-            if (char_id == 0) portrait = find_texture_by_prefix("portraits/barry");
-            else if (char_id == 1) portrait = find_texture_by_prefix("portraits/leon");
-            else if (char_id == 2) portrait = find_texture_by_prefix("portraits/lucia");
-            if (!portrait) portrait = find_texture_by_prefix("portraits/barry");
+    // 2. HD Character Dialog Portraits (ONLY when a dialogue box is open)
+    if (g_hd_pack_config.enable_hd_portraits) {
+        /*
+         * A dialogue box is a window anchored to the BOTTOM of the screen.
+         * The old test - window enabled and WY < 120 - also matched the title
+         * screen and the save menu, which are themselves drawn on the window
+         * layer starting at WY = 0 (verified: LCDC=0xE7, WY=0, WX=7 on the
+         * title screen), so a portrait was painted over every menu.
+         */
+        const uint8_t lcdc = ctx->io[0x40];
+        const uint8_t wy = ctx->io[0x4A];
+        const uint8_t wx = ctx->io[0x4B];
+
+        const bool window_on_screen = (lcdc & 0x20) && (wx <= 166) && !gb_state_is_ui_screen(ctx);
+        const bool bottom_anchored = (wy >= HD_DIALOG_MIN_WY) && (wy <= HD_DIALOG_MAX_WY);
+
+        if (window_on_screen && bottom_anchored) {
+            const HDTexture* portrait = find_texture_by_prefix("portraits/barry");
 
             if (portrait && portrait->sdl_texture) {
-                // Scale portrait position relative to the host display viewport
-                float scale_x = (float)vp_w / 160.0f;
-                float scale_y = (float)vp_h / 144.0f;
-                int p_size = (int)(40.0f * scale_y);
-                int p_x = vp_x + (int)(4.0f * scale_x);
-                int p_y = vp_y + (int)(((float)ctx->io[0x4A] + 4.0f) * scale_y);
+                /*
+                 * Size the portrait to sit INSIDE the dialogue box rather than
+                 * using a fixed 40px square, which was 28% of the screen height
+                 * and overhung the box badly.
+                 */
+                const float scale_y = (float)vp_h / 144.0f;
+                const float scale_x = (float)vp_w / (float)hd_pack_guest_width();
+
+                int box_height_px = 144 - (int)wy;
+                int p_size_guest = box_height_px - (HD_DIALOG_MARGIN * 2);
+                if (p_size_guest > HD_PORTRAIT_MAX) p_size_guest = HD_PORTRAIT_MAX;
+                if (p_size_guest < HD_PORTRAIT_MIN) p_size_guest = HD_PORTRAIT_MIN;
+
+                int p_size = (int)((float)p_size_guest * scale_y);
+                int p_x = vp_x + (int)((float)HD_DIALOG_MARGIN * scale_x);
+                int p_y = vp_y + (int)(((float)wy + (float)HD_DIALOG_MARGIN) * scale_y);
 
                 SDL_Rect dst_rect = { p_x, p_y, p_size, p_size };
                 SDL_RenderCopy(renderer, (SDL_Texture*)portrait->sdl_texture, NULL, &dst_rect);

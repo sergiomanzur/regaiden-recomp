@@ -76,6 +76,8 @@ add_library(gbrt STATIC
     ${CMAKE_CURRENT_SOURCE_DIR}/config_ini.c
     ${CMAKE_CURRENT_SOURCE_DIR}/cheats.c
     ${CMAKE_CURRENT_SOURCE_DIR}/widescreen_ppu.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/state_dump.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/music_pack.c
     ${CMAKE_CURRENT_SOURCE_DIR}/lighting.c
     ${CMAKE_CURRENT_SOURCE_DIR}/postprocess.c
     ${CMAKE_CURRENT_SOURCE_DIR}/hd_pack.c

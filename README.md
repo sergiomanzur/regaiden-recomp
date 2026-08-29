@@ -3,7 +3,7 @@
 [![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Android%20(ARM64)%20%7C%20Linux%20(WIP)-blue.svg)]()
 [![C++](https://img.shields.io/badge/Language-C11%20%2F%20C%2B%2B20-orange.svg)]()
 [![Backend](https://img.shields.io/badge/Graphics-SDL2%20%7C%20Dear%20ImGui%20%7C%20GLES3-green.svg)]()
-[![Release](https://img.shields.io/badge/Release-v0.2.0-red.svg)]()
+[![Release](https://img.shields.io/badge/Release-v0.3.0-red.svg)]()
 [![License](https://img.shields.io/badge/License-MIT-purple.svg)]()
 
 A native static recompilation of **Resident Evil Gaiden** (Game Boy Color, 2001) for modern PC and Android platforms, built in C/C++ with hardware-accelerated SDL2, OpenGLES 3, and Dear ImGui.
@@ -11,6 +11,8 @@ A native static recompilation of **Resident Evil Gaiden** (Game Boy Color, 2001)
 Running directly on native hardware without CPU emulation overhead, this project modernizes the classic maritime survival horror experience with **True Widescreen**, **Dynamic 2D Flashlight Lighting**, **Atmospheric Horror Shaders**, **Touch Controls**, and an **HD Texture Pack Engine**.
 
 ---
+
+> **Note on defaults:** the game boots looking like an unmodified Game Boy Color - native 10:9 aspect, native GBC colours, no shaders, no flashlight, no HD pack. Every enhancement below is opt-in from the in-game menu (`F10`), and your choices are saved to `config.ini`.
 
 ## Highlights & Features
 

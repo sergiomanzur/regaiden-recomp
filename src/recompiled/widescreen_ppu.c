@@ -1,8 +1,12 @@
 #include "widescreen_ppu.h"
 #include "ppu.h"
+#include "game_state.h"
 #include <string.h>
 
 uint32_t g_wide_framebuffer[GB_MAX_FRAMEBUFFER_SIZE];
+
+/* Window start line at or above which the window is covering the whole screen. */
+#define FULLSCREEN_UI_MAX_WY 16
 
 static inline uint32_t rgb555_to_rgba(uint16_t color) {
     uint8_t r = (uint8_t)(((color >> 0) & 0x1F) * 255 / 31);
@@ -27,7 +31,30 @@ int widescreen_get_target_height(void) {
     return GB_NATIVE_HEIGHT; // 144
 }
 
-void widescreen_render_frame(GBContext* ctx, uint32_t* out_fb, int* out_width, int* out_height) {
+
+/*
+ * Copy the dot-accurate 160x144 frame produced by the real PPU into the middle
+ * of the widescreen buffer.
+ *
+ * The wide re-render below works off a single end-of-frame snapshot of VRAM,
+ * OAM and the LCD registers, so it cannot reproduce anything the game changes
+ * part-way through a frame (HBlank HDMA tile streaming on the item viewer,
+ * window and palette raster effects behind dialogue portraits). Those scenes
+ * came out striped and flickering. The PPU already rendered them correctly
+ * scanline by scanline, so the native viewport is taken verbatim from it and
+ * only the newly revealed side columns come from the approximate re-render.
+ */
+static void blit_native_center(uint32_t* out_fb, int target_w, const uint32_t* native_fb) {
+    const int x_offset = (target_w - GB_NATIVE_WIDTH) / 2;
+    for (int y = 0; y < GB_NATIVE_HEIGHT; y++) {
+        memcpy(&out_fb[(size_t)y * (size_t)target_w + (size_t)x_offset],
+               &native_fb[(size_t)y * GB_NATIVE_WIDTH],
+               GB_NATIVE_WIDTH * sizeof(uint32_t));
+    }
+}
+
+void widescreen_render_frame(GBContext* ctx, const uint32_t* native_fb, uint32_t* out_fb,
+                             int* out_width, int* out_height) {
     if (!ctx || !out_fb) return;
 
     int target_w = widescreen_get_target_width();
@@ -36,22 +63,25 @@ void widescreen_render_frame(GBContext* ctx, uint32_t* out_fb, int* out_width, i
     if (out_width) *out_width = target_w;
     if (out_height) *out_height = target_h;
 
+    // Prefer the exact frame the platform layer chose to present; fall back to
+    // the PPU's live framebuffer only when the caller has none.
+    if (!native_fb) {
+        native_fb = gb_get_framebuffer(ctx);
+    }
+
     const GBPPU* ppu = (const GBPPU*)ctx->ppu;
     const uint8_t* vram = ctx->vram;
 
     if (!ppu || !vram || (ctx->io[0x40] & LCDC_LCD_ENABLE) == 0) {
-        const uint32_t* native_fb = gb_get_framebuffer(ctx);
+        memset(out_fb, 0, (size_t)target_w * (size_t)target_h * sizeof(uint32_t));
         if (native_fb) {
-            memcpy(out_fb, native_fb, target_w * target_h * sizeof(uint32_t));
-        } else {
-            memset(out_fb, 0, target_w * target_h * sizeof(uint32_t));
+            blit_native_center(out_fb, target_w, native_fb);
         }
         return;
     }
 
     // Native 10:9 mode
     if (g_app_config.widescreen_mode == ASPECT_NATIVE_10_9 || target_w == GB_NATIVE_WIDTH) {
-        const uint32_t* native_fb = gb_get_framebuffer(ctx);
         if (native_fb) {
             memcpy(out_fb, native_fb, GB_NATIVE_WIDTH * GB_NATIVE_HEIGHT * sizeof(uint32_t));
         }
@@ -76,6 +106,43 @@ void widescreen_render_frame(GBContext* ctx, uint32_t* out_fb, int* out_width, i
     int x_offset = (target_w - GB_NATIVE_WIDTH) / 2; // +48 for 16:9 (256w), +88 for 21:9 (336w)
     int cam_x = (int)scx - x_offset;
 
+    // A Game Boy window only ever covers native screen columns [wx-7, 160), so
+    // the tilemap holds no data for the widened viewport. Reading past it wraps
+    // through `& 0x1F` into unused tilemap columns and draws garbage tiles, so
+    // clamp instead and let the window's edge column extend outwards. When the
+    // window already touches the native left edge it is stretched to the left
+    // border too, keeping full-width dialogue boxes continuous.
+    int win_origin_x = (int)wx - 7;
+    int win_native_w = GB_NATIVE_WIDTH - win_origin_x;
+    if (win_native_w > GB_NATIVE_WIDTH) win_native_w = GB_NATIVE_WIDTH;
+    if (win_native_w < 1) win_native_w = 1;
+    int win_screen_x = win_origin_x + x_offset;
+    int win_screen_start = (win_origin_x <= 0) ? 0 : win_screen_x;
+
+    /*
+     * The extension columns are only trustworthy when they hold real map data.
+     *
+     * A Game Boy tilemap is 32 tiles (256px) wide but the console only ever
+     * shows 20 of those columns, so columns 20-31 hold whatever the game last
+     * left there. While scrolling a room the game keeps them updated and the
+     * extension is genuine; on a UI screen - the item viewer, the inventory, a
+     * menu - it is stale font and tile garbage, which is what showed up down
+     * both sides of the item pickup screen.
+     *
+     * There is no data to invent for those pixels, so they are painted black
+     * rather than filled with whatever happens to be in VRAM.
+     */
+    const bool ui_covers_screen = win_enable && (wx <= 166) && (wy <= FULLSCREEN_UI_MAX_WY);
+
+    /*
+     * On the game's UI screens (inventory, item info, PDA, menus) only the 20
+     * visible tile columns are written; the rest of the map still holds
+     * whatever the player was standing in, which is where the stray font tiles
+     * down both sides of the item screen came from.
+     */
+    const bool extension_untrusted =
+        ui_covers_screen || gb_state_is_ui_screen(ctx) || !bg_enable;
+
     // Buffer to track BG priority and color index per pixel
     static uint8_t bg_color_idx[336];
     static uint8_t bg_priority_flags[336];
@@ -88,14 +155,28 @@ void widescreen_render_frame(GBContext* ctx, uint32_t* out_fb, int* out_width, i
 
         bool line_in_window = win_enable && (y >= (int)wy);
 
+        /* A window row shows UI, not world: nothing to extend outwards. */
+        const bool blank_extension = extension_untrusted || line_in_window;
+
         // 1. Render Background & Window across full width
         for (int x = 0; x < target_w; x++) {
-            bool pixel_in_win = line_in_window && (x >= (int)wx - 7 + x_offset);
+            const bool x_in_native = (x >= x_offset) && (x < x_offset + GB_NATIVE_WIDTH);
+
+            if (blank_extension && !x_in_native) {
+                bg_color_idx[x] = 0;
+                bg_priority_flags[x] = 0;
+                row_dst[x] = 0xFF000000u;
+                continue;
+            }
+
+            bool pixel_in_win = line_in_window && (x >= win_screen_start);
             uint16_t tilemap_base;
             uint8_t tile_x, t_y, f_x, f_y;
 
             if (pixel_in_win) {
-                int win_x = x - ((int)wx - 7 + x_offset);
+                int win_x = x - win_screen_x;
+                if (win_x < 0) win_x = 0;
+                if (win_x >= win_native_w) win_x = win_native_w - 1;
                 int win_y = y - (int)wy;
                 tilemap_base = win_tilemap_offset;
                 tile_x = (uint8_t)((win_x / 8) & 0x1F);
@@ -184,6 +265,12 @@ void widescreen_render_frame(GBContext* ctx, uint32_t* out_fb, int* out_width, i
                     if (screen_x < 0 || screen_x >= target_w) {
                         continue;
                     }
+                    /* Keep sprites out of the blanked side columns so nothing
+                     * floats in the black. */
+                    if (blank_extension &&
+                        (screen_x < x_offset || screen_x >= x_offset + GB_NATIVE_WIDTH)) {
+                        continue;
+                    }
 
                     int bit = flip_x ? px : (7 - px);
                     uint8_t color_idx = (uint8_t)(((lo >> bit) & 1) | (((hi >> bit) & 1) << 1));
@@ -206,5 +293,10 @@ void widescreen_render_frame(GBContext* ctx, uint32_t* out_fb, int* out_width, i
                 }
             }
         }
+    }
+
+    // Replace the native viewport with the PPU's dot-accurate output.
+    if (native_fb) {
+        blit_native_center(out_fb, target_w, native_fb);
     }
 }

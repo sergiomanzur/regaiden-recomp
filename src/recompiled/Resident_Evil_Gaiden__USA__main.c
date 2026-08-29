@@ -278,6 +278,10 @@ int Resident_Evil_Gaiden__USA__main(int argc, char* argv[]) {
             gb_platform_set_input_record_file(argv[++i]);
         } else if (strcmp(argv[i], "--dump-frames") == 0 && i + 1 < argc) {
             gb_platform_set_dump_frames(argv[++i]);
+        } else if (strcmp(argv[i], "--snapshot-frames") == 0 && i + 1 < argc) {
+            gb_platform_set_snapshot_frames(argv[++i]);
+        } else if (strcmp(argv[i], "--composed-frames") == 0 && i + 1 < argc) {
+            gb_platform_set_composed_frames(argv[++i]);
         } else if (strcmp(argv[i], "--dump-present-frames") == 0 && i + 1 < argc) {
             gb_platform_set_dump_present_frames(argv[++i]);
         } else if (strcmp(argv[i], "--screenshot-prefix") == 0 && i + 1 < argc) {

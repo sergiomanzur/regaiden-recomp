@@ -6,11 +6,34 @@
 
 AppConfig g_app_config;
 
-static const char* DEFAULT_INI_NAME = "config.ini";
+/*
+ * Where config.ini lives when callers pass NULL.
+ *
+ * Defaults to the process working directory, which is right for desktop
+ * builds. Android has no writable working directory, so every load fell back
+ * to compiled defaults and every save silently failed - the platform layer
+ * calls config_set_default_path() at startup to point this at app storage.
+ */
+static char s_default_ini_path[512] = "config.ini";
+
+void config_set_default_path(const char* path) {
+    if (!path || !path[0]) {
+        return;
+    }
+    snprintf(s_default_ini_path, sizeof(s_default_ini_path), "%s", path);
+}
+
+const char* config_get_default_path(void) {
+    return s_default_ini_path;
+}
 
 void config_set_defaults(AppConfig* cfg) {
     if (!cfg) return;
     memset(cfg, 0, sizeof(*cfg));
+
+    // Defaults deliberately reproduce the original Game Boy Color presentation.
+    // Every enhancement (widescreen, flashlight, atmosphere shaders, HD pack) is
+    // opt-in from the in-game menu so a first run looks like the real hardware.
 
     // [Display]
     cfg->widescreen_mode = ASPECT_NATIVE_10_9;
@@ -23,28 +46,35 @@ void config_set_defaults(AppConfig* cfg) {
     cfg->orientation_lock = 0; // 0=Auto (Sensor), 1=Landscape, 2=Portrait
 
     // [Lighting]
-    cfg->flashlight_enabled = true;
+    cfg->flashlight_enabled = false;
     cfg->flashlight_intensity = 85;
     cfg->ambient_darkness = 25;
     cfg->flashlight_flicker = true;
 
     // [Atmosphere]
-    cfg->vignette_enabled = true;
+    cfg->vignette_enabled = false;
     cfg->vignette_intensity = 45;
-    cfg->film_grain_enabled = true;
+    cfg->film_grain_enabled = false;
     cfg->grain_intensity = 25;
-    cfg->scanlines_enabled = true;
+    cfg->scanlines_enabled = false;
     cfg->scanline_intensity = 30;
     cfg->crt_mask_enabled = false;
     cfg->crt_mask_intensity = 20;
-    cfg->color_grade_mode = 1; // Cold Biohazard
+    cfg->color_grade_mode = 0; // Native GBC Colors
 
     // [HDPack]
-    cfg->enable_hd_pack = true;
+    cfg->enable_hd_pack = false;
     strncpy(cfg->hd_pack_path, "hd_pack", sizeof(cfg->hd_pack_path) - 1);
     cfg->enable_hd_backgrounds = true;
     cfg->enable_hd_monsters = true;
     cfg->enable_hd_portraits = true;
+
+    // [MusicPack] - user-supplied replacement soundtrack, off until enabled
+    cfg->enable_music_pack = false;
+    strncpy(cfg->music_pack_path, "music_pack", sizeof(cfg->music_pack_path) - 1);
+    cfg->music_volume = 85;
+    cfg->music_duck_percent = 25;
+    cfg->music_loop = true;
 
     // [Audio]
     cfg->audio_enabled = true;
@@ -78,7 +108,7 @@ static char* trim_whitespace(char* str) {
 }
 
 bool config_load_ini(const char* file_path) {
-    const char* path = (file_path && file_path[0]) ? file_path : DEFAULT_INI_NAME;
+    const char* path = (file_path && file_path[0]) ? file_path : s_default_ini_path;
     FILE* f = fopen(path, "r");
     if (!f) {
         config_set_defaults(&g_app_config);
@@ -144,6 +174,15 @@ bool config_load_ini(const char* file_path) {
             else if (strcmp(key, "enable_hd_backgrounds") == 0) g_app_config.enable_hd_backgrounds = (atoi(val) != 0 || strcmp(val, "true") == 0);
             else if (strcmp(key, "enable_hd_monsters") == 0) g_app_config.enable_hd_monsters = (atoi(val) != 0 || strcmp(val, "true") == 0);
             else if (strcmp(key, "enable_hd_portraits") == 0) g_app_config.enable_hd_portraits = (atoi(val) != 0 || strcmp(val, "true") == 0);
+        } else if (strcmp(section, "MusicPack") == 0) {
+            if (strcmp(key, "enable_music_pack") == 0) g_app_config.enable_music_pack = (atoi(val) != 0 || strcmp(val, "true") == 0);
+            else if (strcmp(key, "music_pack_path") == 0) {
+                strncpy(g_app_config.music_pack_path, val, sizeof(g_app_config.music_pack_path) - 1);
+                g_app_config.music_pack_path[sizeof(g_app_config.music_pack_path) - 1] = '\0';
+            }
+            else if (strcmp(key, "volume") == 0) g_app_config.music_volume = atoi(val);
+            else if (strcmp(key, "duck_percent") == 0) g_app_config.music_duck_percent = atoi(val);
+            else if (strcmp(key, "loop") == 0) g_app_config.music_loop = (atoi(val) != 0 || strcmp(val, "true") == 0);
         } else if (strcmp(section, "Audio") == 0) {
             if (strcmp(key, "enabled") == 0) g_app_config.audio_enabled = (atoi(val) != 0 || strcmp(val, "true") == 0);
             else if (strcmp(key, "muted") == 0) g_app_config.audio_muted = (atoi(val) != 0 || strcmp(val, "true") == 0);
@@ -178,7 +217,7 @@ bool config_load_ini(const char* file_path) {
 }
 
 bool config_save_ini(const char* file_path) {
-    const char* path = (file_path && file_path[0]) ? file_path : DEFAULT_INI_NAME;
+    const char* path = (file_path && file_path[0]) ? file_path : s_default_ini_path;
     FILE* f = fopen(path, "w");
     if (!f) {
         fprintf(stderr, "[Config] Failed to open '%s' for writing\n", path);
@@ -220,6 +259,13 @@ bool config_save_ini(const char* file_path) {
     fprintf(f, "enable_hd_backgrounds=%d\n", g_app_config.enable_hd_backgrounds ? 1 : 0);
     fprintf(f, "enable_hd_monsters=%d\n", g_app_config.enable_hd_monsters ? 1 : 0);
     fprintf(f, "enable_hd_portraits=%d\n\n", g_app_config.enable_hd_portraits ? 1 : 0);
+
+    fprintf(f, "[MusicPack]\n");
+    fprintf(f, "enable_music_pack=%d\n", g_app_config.enable_music_pack ? 1 : 0);
+    fprintf(f, "music_pack_path=%s\n", g_app_config.music_pack_path);
+    fprintf(f, "volume=%d\n", g_app_config.music_volume);
+    fprintf(f, "duck_percent=%d\n", g_app_config.music_duck_percent);
+    fprintf(f, "loop=%d\n\n", g_app_config.music_loop ? 1 : 0);
 
     fprintf(f, "[Audio]\n");
     fprintf(f, "enabled=%d\n", g_app_config.audio_enabled ? 1 : 0);

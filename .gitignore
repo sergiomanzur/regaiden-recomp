@@ -43,3 +43,9 @@ android/captures/
 android/.externalNativeBuild/
 android/app/*.apk
 
+
+# Runtime-mutated settings file (ships from config.default.ini)
+config.ini
+
+# Local test staging directory
+testbuild/
