@@ -1008,6 +1008,21 @@ static void set_default_input_bindings(void) {
     clear_all_binding_pressed_state();
 }
 
+/*
+ * Root for player-supplied asset packs. Empty on desktop, where a path next to
+ * the executable is what people expect; on Android this is external app
+ * storage, the only location a file manager or USB transfer can reach.
+ */
+static std::string platform_external_asset_root(void) {
+#if defined(__ANDROID__)
+    const char* external = SDL_AndroidGetExternalStoragePath();
+    if (external && external[0]) {
+        return std::string(external);
+    }
+#endif
+    return std::string();
+}
+
 static std::string runtime_preferences_path(void) {
     const std::string pref_dir = make_pref_storage_dir("runtime");
     if (!pref_dir.empty()) {
@@ -3690,8 +3705,28 @@ bool gb_platform_init(int scale) {
     load_runtime_preferences();
     lighting_init();
     postprocess_init();
-    hd_pack_init(g_app_config.hd_pack_path);
-    music_pack_init(g_app_config.music_pack_path);
+    /*
+     * Asset packs have to live somewhere the player can actually put files.
+     * A bare relative path resolves against the process working directory,
+     * which on Android is not writable and not reachable with a file manager,
+     * so hd_pack/ and music_pack/ were silently dead there. Resolve them into
+     * external app storage instead: /sdcard/Android/data/<package>/files/.
+     */
+    {
+        std::string hd_dir = g_app_config.hd_pack_path;
+        std::string music_dir = g_app_config.music_pack_path;
+        const std::string asset_root = platform_external_asset_root();
+        if (!asset_root.empty()) {
+            if (!fs::path(hd_dir).is_absolute()) {
+                hd_dir = (fs::path(asset_root) / hd_dir).lexically_normal().string();
+            }
+            if (!fs::path(music_dir).is_absolute()) {
+                music_dir = (fs::path(asset_root) / music_dir).lexically_normal().string();
+            }
+        }
+        hd_pack_init(hd_dir.c_str());
+        music_pack_init(music_dir.c_str());
+    }
     fprintf(stderr, "[SDL] SDL initialized.\n");
 
 #if defined(__ANDROID__)

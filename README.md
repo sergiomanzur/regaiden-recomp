@@ -39,6 +39,8 @@ Running directly on native hardware without CPU emulation overhead, this project
   - `Silent Monochrome` (classic black-and-white noir mode)
 
 ### 4. HD Texture Pack & Modding Engine (`hd_pack/`)
+> **The bundled `hd_pack/` is AI slop.** It is a quick proof of concept to show the engine works, nothing more - machine-generated placeholder art that does not match the game's style and was never meant to ship as a finished look. **Please replace it.** See [Making Your Own Asset Packs](#making-your-own-asset-packs) below. If you make something good, open a PR or an issue and it can be linked from here.
+
 - **Native PNG Decoder**: Embedded `stb_image` for zero-dependency high-speed image loading.
 - **Host-Resolution Compositing**: High-definition assets render at **full native monitor resolution (1080p / 4K)**:
   - `hd_pack/backgrounds/`: HD 16:9 pre-rendered battle backgrounds (e.g. *Starlight Corridor*).
@@ -46,15 +48,21 @@ Running directly on native hardware without CPU emulation overhead, this project
   - `hd_pack/portraits/`: HD character dialogue portraits (*Barry Burton*, *Leon S. Kennedy*, *Lucia*).
 - **Hot-Reloading**: Edit or swap PNG assets and click **"Reload HD Textures"** in the in-game menu without restarting the game.
 
-### 5. Built-in Cheats & GameShark Code Engine
+### 5. Replacement Soundtrack (`music_pack/`)
+- **Bring Your Own Music**: Drop `.ogg` or `.wav` files into `music_pack/` to replace the in-game soundtrack.
+- **Follows the Game**: Tracks are matched to the game's own music ids, so the right music plays in the right place. Any id you have not supplied keeps the original music.
+- **Sound Effects Preserved**: Game Boy music and SFX share the same four channels, so the emulated audio is *ducked* rather than muted while your music plays - gunshots, doors and menu blips still come through.
+- **No music is bundled.** Like the ROM, the files are yours to supply.
+
+### 6. Built-in Cheats & GameShark Code Engine
 - **One-Click Cheats**: Infinite Health (Barry, Leon, Lucia), Infinite Ammo (All Weapons), One-Hit Kill, Reticle Freeze / Always Perfect Hit, Unlock All Weapons (Shotgun, Grenades, Rifle), and Infinite Items.
 - **Custom GameShark Codes**: Add and manage arbitrary 8-character GameShark / GameGenie RAM patch codes at runtime.
 
-### 6. Multi-Slot Savestate Manager
-- **10 Dedicated Savestate Slots**: Save and load instantly via the in-game overlay menu or shortcut keys (`F5` Save, `F7` Load, `F6`/`F8` Slot change).
+### 7. Multi-Slot Savestate Manager
+- **10 Dedicated Savestate Slots**: Save and load instantly via the in-game overlay menu or shortcut keys (`F5` Save, `F8` Load, `F6`/`F7` Slot change).
 - Automatic battery-backed SRAM persistence for native in-game typewriter save points.
 
-### 7. Modern Controller, Keyboard & Mobile Touch Controls
+### 8. Modern Controller, Keyboard & Mobile Touch Controls
 - Full support for **XInput (Xbox)**, **PlayStation (DualShock / DualSense)**, **Retroid Pocket**, and **generic USB gamepads**.
 - **Android Virtual Touch Gamepad**: On-screen D-Pad, action buttons, quick settings button, and controller show/hide toggle.
 - **Portrait & Landscape Adaptive Layouts** with in-game orientation locking.
@@ -64,9 +72,111 @@ Running directly on native hardware without CPU emulation overhead, this project
 
 ## Platform Availability & Roadmap
 
-- [x] **Windows (x86_64)**: Fully supported with static CRT, embedded icon, and release archive (**Release v0.2.0**).
-- [x] **Android (ARM64-v8a)**: Fully supported with touch gamepad, Retroid Pocket optimization, and legal ROM onboarding (**Release v0.2.0**).
+- [x] **Windows (x86_64)**: Fully supported with static CRT, embedded icon, and release archive (**Release v0.3.0**).
+- [x] **Android (ARM64-v8a)**: Fully supported with touch gamepad, Retroid Pocket optimization, and legal ROM onboarding (**Release v0.3.0**).
 - [ ] **Linux (x86_64 / ARM64)**: Native SDL2 + Vulkan build in active preparation.
+
+---
+
+## Making Your Own Asset Packs
+
+Both asset packs are plain folders of ordinary files. Nothing is compiled in, nothing is packed into an archive - drop files in, restart or hot-reload, done. No tooling required.
+
+> **About the bundled `hd_pack/`:** it is **AI slop**. It exists purely to prove the engine works. The art is machine-generated placeholder junk that does not match the game's aesthetic, and it should not be taken as the intended look. If you have any pixel-art ability at all you will do better. Please replace it - and if you make something good, open a PR or an issue so it can be linked here for everyone.
+
+### Where the folders live
+
+| Platform | Location |
+| :--- | :--- |
+| **Windows** | `hd_pack/` and `music_pack/` next to `Resident_Evil_Gaiden__USA_.exe` |
+| **Android** | `/sdcard/Android/data/com.capcom.regaiden/files/hd_pack/` and `.../music_pack/` |
+
+Both folders (and the `hd_pack` subfolders) are created automatically the first time you run the game, so the easiest way to find them is to launch once and then look.
+
+---
+
+### HD Texture Pack (`hd_pack/`)
+
+HD textures are drawn at your **monitor's** resolution, on top of the Game Boy image - so they are not limited to 160x144. A 1024x1024 PNG is perfectly reasonable.
+
+```
+hd_pack/
+  backgrounds/
+    battle.png          <- pre-rendered battle background
+    battle_0.png
+  monsters/
+    zombie_0.png        <- battle monster / zombie sprites
+    monster.png
+  portraits/
+    barry.png           <- character dialogue portraits
+    leon.png
+    lucia.png
+```
+
+**Format:** PNG, RGBA. Transparency is respected, so give monsters and portraits a transparent background rather than a solid colour.
+
+**Sizing:** backgrounds are stretched to the whole game viewport, so match your aspect ratio (16:9 works well). Monsters and portraits are scaled proportionally to the viewport height, so square images are easiest to work with.
+
+**Matching is by filename prefix.** A background is used if its name contains `backgrounds/battle`, a monster if it contains `monsters/zombie` or `monsters/monster`, and so on. That means `battle_starlight_corridor.png` works fine - you are not limited to the exact names above.
+
+**Hot-reload:** edit a PNG and press **Reload HD Textures** in the in-game menu (`F10`). No restart needed, which makes iterating on art quick.
+
+Enable the pack with **Enable HD Texture Pack** in the menu. It is off by default.
+
+---
+
+### Replacement Soundtrack (`music_pack/`)
+
+```
+music_pack/
+  track_2.ogg           <- replaces the game's music id 2
+  track_10.ogg          <- replaces music id 10
+  ...
+```
+
+**Formats:** `.ogg` (Ogg Vorbis) and `.wav`. OGG is strongly preferred - a three-minute WAV is about 30 MB, which adds up fast, especially on a phone. Any sample rate and channel count works; files are converted to 44.1 kHz stereo when loaded.
+
+**Naming:** `track_<id>`, where `<id>` is the game's own music id. Tracks then follow the game automatically - the right music plays in the right place, and any id you have not supplied simply keeps the original Game Boy music. That means you can replace one track and leave the rest alone.
+
+**Finding the id for a piece of music:**
+
+1. Open the in-game menu (`F10` on desktop, the gear icon on Android)
+2. Enable **Enable Music Pack**
+3. Play until the music you want to replace is playing
+4. The menu shows **`Now playing: track id N`** - name your file `track_N.ogg`
+
+**Sound effects.** Game Boy music and SFX share the same four audio channels, so there is no way to mute only the music. The emulated audio is turned **down** instead, which keeps gunshots, doors and menu blips audible under your track. Two sliders control the balance:
+
+- **Music Volume** - how loud your replacement track is
+- **Game Audio While Music Plays** - how loud the original Game Boy audio stays (default 25%). Lower it for less of the original melody bleeding through; raise it to keep sound effects punchier.
+
+**Looping** is on by default, so short tracks repeat rather than falling silent.
+
+---
+
+### Getting your files onto Android
+
+Everything lives in the app's external storage folder, which is reachable without root:
+
+```
+/sdcard/Android/data/com.capcom.regaiden/files/
+    hd_pack/
+    music_pack/
+```
+
+**Run the game once first** - that creates the folders.
+
+- **USB from a PC:** connect the phone, set the USB mode to *File Transfer / MTP*, then browse to `Internal storage > Android > data > com.capcom.regaiden > files` and copy your `hd_pack` / `music_pack` contents in.
+- **On the device:** most file managers can reach `Android/data` directly. On Android 11+ some stock file managers restrict it - if yours does, use a manager that supports the Storage Access Framework picker, or copy the files over USB.
+- **ADB:**
+  ```bash
+  adb push music_pack/. /sdcard/Android/data/com.capcom.regaiden/files/music_pack/
+  adb push hd_pack/.    /sdcard/Android/data/com.capcom.regaiden/files/hd_pack/
+  ```
+
+After copying, either restart the game or use **Reload HD Textures** / **Reload Music Pack** in the menu.
+
+> The same folder is also where **state snapshots** are written if you use the diagnostics button, which makes them easy to pull off the device and attach to a bug report.
 
 ---
 
@@ -79,26 +189,34 @@ Running directly on native hardware without CPU emulation overhead, this project
 | **Move Down** | `S` | `Down Arrow` |
 | **Move Left** | `A` | `Left Arrow` |
 | **Move Right** | `D` | `Right Arrow` |
-| **A / Confirm / Shoot** | `K` | `Z` |
-| **B / Cancel / Run** | `J` | `X` |
-| **Select / Map** | `Backspace` | `Tab` |
-| **Start / Inventory** | `Enter` | `Space` |
-| **In-Game Settings Menu** | `Escape` | `F1` |
+| **A / Confirm / Shoot** | `Z` | `J` |
+| **B / Cancel / Run** | `X` | `K` |
+| **Select / Map** | `Backspace` | `Right Shift` |
+| **Start / Inventory** | `Enter` | - |
+| **In-Game Settings Menu** | `F10` | `Escape` |
 | **Quick Save State** | `F5` | - |
-| **Quick Load State** | `F7` | - |
-| **Fast Forward (2x)** | `Space` | `Tab` |
+| **Quick Load State** | `F8` | - |
+| **Previous / Next Save Slot** | `F6` | `F7` |
+| **Fast Forward** | `Tab` | - |
+| **Toggle Max Speed** | `` ` `` (backtick) | - |
+| **Toggle Mute** | `M` | - |
+| **Performance Overlay** | `F1` | - |
+| **Capture State Snapshot** | `F4` | - |
 
 ### Gamepad Defaults (Xbox / PlayStation)
 | Action | Xbox Button | PlayStation Button |
 | :--- | :--- | :--- |
 | **Movement** | D-Pad / Left Stick | D-Pad / Left Stick |
-| **A / Action** | `A` | `Cross` |
-| **B / Cancel** | `B` | `Circle` |
+| **A / Action** | `B` | `Circle` |
+| **B / Cancel** | `A` | `Cross` |
 | **Select** | `Back` / `View` | `Share` / `Select` |
 | **Start** | `Start` / `Menu` | `Options` / `Start` |
 | **In-Game Menu** | `Left Stick Click (L3)` | `L3` |
-| **Quick Save** | `Right Bumper (RB)` | `R1` |
-| **Quick Load** | `Left Bumper (LB)` | `L1` |
+| **Quick Save** | `X` | `Square` |
+| **Quick Load** | `Y` | `Triangle` |
+| **Fast Forward** | `Right Trigger (RT)` | `R2` |
+
+> The face buttons follow the Nintendo layout: the **right-hand** button is Game Boy `A`, so on an Xbox pad that is the `B` button. All bindings are remappable in the in-game menu.
 
 ---
 
