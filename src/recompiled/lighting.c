@@ -1,4 +1,5 @@
 #include "lighting.h"
+#include "game_state.h"
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
@@ -7,14 +8,18 @@
 #define M_PI 3.14159265358979323846
 #endif
 
+// Opt-in enhancement: off until the player enables it (see config_set_defaults).
 LightingConfig g_lighting_config = {
-    .enabled = true,
+    .enabled = false,
     .intensity = 85,
     .ambient_darkness = 25,
     .flicker_enabled = true,
     .cone_angle_deg = 65,
     .cone_distance = 140
 };
+
+/* Window start line at or above which the window is covering the whole screen. */
+#define FULLSCREEN_UI_MAX_WY 16
 
 static PlayerFacingDir s_player_dir = DIR_DOWN;
 static uint32_t s_frame_counter = 0;
@@ -109,6 +114,24 @@ void lighting_update_player_dir(uint8_t dpad_state) {
     else if (!(dpad_state & 0x08)) s_player_dir = DIR_DOWN;
 }
 
+/*
+ * A window layer that starts at the top of the screen is a full-screen UI -
+ * the title screen, the save/load menu, the inventory. Verified on the title
+ * screen: LCDC=0xE7 (window enabled), WY=0, WX=7, i.e. the menu itself is
+ * drawn on the window layer covering all 144 lines. A dialogue box, by
+ * contrast, is anchored near the bottom.
+ */
+static bool is_full_screen_ui(const GBContext* ctx) {
+    uint8_t lcdc = ctx->io[0x40];
+    if (!(lcdc & 0x20)) {
+        return false; // window disabled
+    }
+    if (ctx->io[0x4B] > 166) {
+        return false; // window pushed off the right edge
+    }
+    return ctx->io[0x4A] <= FULLSCREEN_UI_MAX_WY;
+}
+
 static bool is_exploration_gameplay(const GBContext* ctx) {
     if (!ctx || !ctx->oam) return false;
 
@@ -118,7 +141,12 @@ static bool is_exploration_gameplay(const GBContext* ctx) {
         return false;
     }
 
-    // 2. Active sprites present on screen
+    // 2. The game's own UI screens are not gameplay
+    if (gb_state_is_ui_screen(ctx) || is_full_screen_ui(ctx)) {
+        return false;
+    }
+
+    // 3. Active sprites present on screen
     for (int i = 0; i < 40; i++) {
         uint8_t y = ctx->oam[i * 4];
         uint8_t x = ctx->oam[i * 4 + 1];
@@ -135,20 +163,19 @@ void lighting_apply(GBContext* ctx, uint32_t* framebuffer, int width, int height
         return;
     }
 
-    // In battle mode, apply atmospheric darkness without Barry's walking cone
-    if (ctx->wram && ctx->wram[0x0900] > 0) {
-        uint32_t amb_mul = (uint32_t)(g_lighting_config.ambient_darkness * 256 / 100);
-        if (amb_mul < 150) amb_mul = 150; // Keep battle clearly visible
-        int total_pixels = width * height;
-        for (int i = 0; i < total_pixels; i++) {
-            uint32_t p = framebuffer[i];
-            uint32_t r = ((p >> 16) & 0xFF) * amb_mul >> 8;
-            uint32_t g = ((p >> 8) & 0xFF) * amb_mul >> 8;
-            uint32_t b = (p & 0xFF) * amb_mul >> 8;
-            framebuffer[i] = 0xFF000000u | (r << 16) | (g << 8) | b;
-        }
+    // The light LUT is only dimensioned for the supported viewport sizes.
+    if (width > LUT_MAX_W || height > LUT_MAX_H) {
         return;
     }
+
+    /*
+     * There was a "battle mode" branch here keyed on wram[0x0900] > 0, applying
+     * a flat darkening instead of the cone. $C900 is not a battle flag: the only
+     * code in the ROM that touches it is a 0x50-byte save/restore memcpy, and it
+     * reads as all zeroes outside gameplay, so the branch never fired reliably
+     * and the cone ran during shooting sequences. Removed rather than left
+     * guessing - see the state snapshots for finding the real flag.
+     */
 
     // Flashlight requires active player exploration
     if (!is_exploration_gameplay(ctx)) {
@@ -171,30 +198,43 @@ void lighting_apply(GBContext* ctx, uint32_t* framebuffer, int width, int height
         flicker_factor += noise;
     }
 
-    int intensity_scaled = (g_lighting_config.intensity * flicker_factor) >> 8;
+    // intensity is a 0-100 percentage; convert it to the 0-256 fixed-point scale
+    // the blend below expects. Feeding the raw percentage in made the cone peak
+    // at roughly a third of its intended brightness.
+    int intensity_256 = (g_lighting_config.intensity * 256) / 100;
+    int intensity_scaled = (intensity_256 * flicker_factor) >> 8;
     if (intensity_scaled > 256) intensity_scaled = 256;
+    if (intensity_scaled < 0) intensity_scaled = 0;
 
     uint32_t ambient_256 = (uint32_t)(g_lighting_config.ambient_darkness * 256 / 100);
-    const uint8_t* lut_ptr = &s_light_lut[(int)s_player_dir][0][0];
+    if (ambient_256 > 256) ambient_256 = 256;
 
-    int total_pixels = width * height;
+    // The LUT has a fixed LUT_MAX_W stride, so it has to be indexed row by row.
+    // Walking it linearly against the framebuffer only lined up at 336px wide
+    // (21:9) and sampled the wrong coordinates in native 10:9 and 16:9.
+    const uint8_t (*lut)[LUT_MAX_W] = s_light_lut[(int)s_player_dir];
 
     // Blazing fast integer SIMD-ready lighting loop (< 0.03ms per frame)
-    for (int i = 0; i < total_pixels; i++) {
-        uint32_t p = framebuffer[i];
-        uint32_t r = (p >> 16) & 0xFF;
-        uint32_t g = (p >> 8) & 0xFF;
-        uint32_t b = p & 0xFF;
+    for (int y = 0; y < height; y++) {
+        const uint8_t* lut_row = lut[y];
+        uint32_t* row = &framebuffer[(size_t)y * (size_t)width];
 
-        uint32_t light_val = lut_ptr[i]; // 0 to 255
-        uint32_t light_contrib = (light_val * intensity_scaled * (256 - ambient_256)) >> 16;
-        uint32_t total_light = ambient_256 + light_contrib;
-        if (total_light > 256) total_light = 256;
+        for (int x = 0; x < width; x++) {
+            uint32_t p = row[x];
+            uint32_t r = (p >> 16) & 0xFF;
+            uint32_t g = (p >> 8) & 0xFF;
+            uint32_t b = p & 0xFF;
 
-        r = (r * total_light) >> 8;
-        g = (g * total_light) >> 8;
-        b = (b * total_light) >> 8;
+            uint32_t light_val = lut_row[x]; // 0 to 255
+            uint32_t light_contrib = (light_val * (uint32_t)intensity_scaled * (256 - ambient_256)) >> 16;
+            uint32_t total_light = ambient_256 + light_contrib;
+            if (total_light > 256) total_light = 256;
 
-        framebuffer[i] = 0xFF000000u | (r << 16) | (g << 8) | b;
+            r = (r * total_light) >> 8;
+            g = (g * total_light) >> 8;
+            b = (b * total_light) >> 8;
+
+            row[x] = 0xFF000000u | (r << 16) | (g << 8) | b;
+        }
     }
 }

@@ -51,6 +51,13 @@ typedef struct {
     bool enable_hd_monsters;
     bool enable_hd_portraits;
 
+    // [MusicPack]
+    bool enable_music_pack;
+    char music_pack_path[256];
+    int music_volume;          // 0 - 100, replacement track level
+    int music_duck_percent;    // 0 - 100, emulated APU level while music plays
+    bool music_loop;
+
     // [Audio]
     bool audio_enabled;
     bool audio_muted;
@@ -78,6 +85,19 @@ extern AppConfig g_app_config;
  * @brief Initialize configuration with defaults.
  */
 void config_set_defaults(AppConfig* cfg);
+
+/**
+ * @brief Override the path used when config_load_ini/config_save_ini get NULL.
+ *
+ * Desktop builds keep the default of "config.ini" next to the executable;
+ * Android points this at per-app storage, which is the only writable location.
+ */
+void config_set_default_path(const char* path);
+
+/**
+ * @brief Path currently used when config_load_ini/config_save_ini get NULL.
+ */
+const char* config_get_default_path(void);
 
 /**
  * @brief Load configuration from config.ini.

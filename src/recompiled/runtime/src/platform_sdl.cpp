@@ -44,6 +44,12 @@
 #include "lighting.h"
 #include "postprocess.h"
 #include "hd_pack.h"
+#include "state_dump.h"
+#include "music_pack.h"
+#include "game_state.h"
+
+/* Frames the guest music id must hold before a replacement track is swapped. */
+#define MUSIC_ID_DEBOUNCE_FRAMES 8
 #include "touch_overlay.h"
 #include "stb_image.h"
 
@@ -168,6 +174,7 @@ static constexpr int GB_FAST_FORWARD_SPEED_PERCENT = 250;
 static constexpr int GB_MAX_SHORTCUT_SPEED_PERCENT = 500;
 static int g_savestate_slot = 0;
 static std::string g_savestate_status;
+static std::string g_snapshot_status;
 static const char* g_render_scaling_mode_names[] = {
     "Pixel Perfect",
     "Aspect Fit",
@@ -189,6 +196,19 @@ static bool g_lcd_off_framebuffer_initialized = false;
 static bool g_last_guest_framebuffer_valid = false;
 static uint64_t g_present_count = 0;
 static GBContext* g_registered_ctx = NULL;
+
+/*
+ * Capture a guest memory snapshot for offline analysis. Exposed on both
+ * platforms (menu button, plus F4 on desktop) so real game-state addresses can
+ * be located by diffing snapshots taken in different game states, rather than
+ * guessed - the flashlight gate, HD portrait selection and the built-in cheats
+ * all currently read addresses the disassembly cannot corroborate.
+ */
+static void capture_guest_snapshot(const char* label) {
+    char status[512];
+    state_dump_capture(g_registered_ctx, label, status, sizeof(status));
+    g_snapshot_status = status;
+}
 static GBPortFrame g_port_frame = {};
 static bool g_port_frame_valid = false;
 static GBInputBinding g_keyboard_bindings[GB_INPUT_ACTION_COUNT][2] = {};
@@ -306,6 +326,10 @@ static uint8_t g_input_record_buttons = 0xFF;
 
 #define MAX_DUMP_FRAMES 100
 static uint32_t g_dump_frames[MAX_DUMP_FRAMES];
+static uint32_t g_snapshot_frames[MAX_DUMP_FRAMES];
+static int g_snapshot_frame_count = 0;
+static uint32_t g_composed_frames[MAX_DUMP_FRAMES];
+static int g_composed_frame_count = 0;
 static int g_dump_count = 0;
 static uint32_t g_dump_present_frames[MAX_DUMP_FRAMES];
 static int g_dump_present_count = 0;
@@ -1002,12 +1026,46 @@ static void load_runtime_preferences(void) {
     g_max_speed_mode = false;
     bool saw_controller_port_ui_binding = false;
 
-    // Load from config.ini
+    // Load from config.ini. On Android the working directory is not writable, so
+    // point the default path at per-app storage or settings would never persist.
+    {
+        const std::string config_path = resolve_writable_path("config.ini", "runtime");
+        if (!config_path.empty()) {
+            config_set_default_path(config_path.c_str());
+        }
+    }
     config_load_ini(NULL);
+    {
+        /* Snapshots exist to be copied off the device and inspected, so on
+         * Android they go to external app storage (/sdcard/Android/data/<pkg>/
+         * files/snapshots), which a file manager or USB transfer can reach.
+         * SDL_GetPrefPath would put them in internal storage, out of reach
+         * without root. */
+        std::string snapshot_dir;
+#if defined(__ANDROID__)
+        const char* external = SDL_AndroidGetExternalStoragePath();
+        if (external && external[0]) {
+            snapshot_dir = (fs::path(external) / "snapshots").lexically_normal().string();
+        }
+#endif
+        if (snapshot_dir.empty()) {
+            snapshot_dir = resolve_writable_path("snapshots", "runtime");
+        }
+        if (!snapshot_dir.empty()) {
+            std::error_code snapshot_ec;
+            fs::create_directories(snapshot_dir, snapshot_ec);
+            state_dump_set_output_dir(snapshot_dir.c_str());
+        }
+    }
     g_render_scaling_mode = (GBRenderScalingMode)g_app_config.scaling_mode;
     g_render_filter_mode = (GBRenderFilterMode)g_app_config.filter_mode;
     g_fullscreen = g_app_config.fullscreen;
     g_scale = g_app_config.window_scale;
+    /* [General] speed_percent was parsed and saved but never applied, so the
+     * setting did nothing. */
+    if (g_app_config.speed_percent > 0) {
+        g_speed_percent = g_app_config.speed_percent;
+    }
     if (g_scale < 1) g_scale = 1;
     if (g_scale > 8) g_scale = 8;
     g_vsync = g_app_config.vsync;
@@ -1037,6 +1095,13 @@ static void load_runtime_preferences(void) {
     g_postprocess_config.crt_mask_enabled = g_app_config.crt_mask_enabled;
     g_postprocess_config.crt_mask_intensity = g_app_config.crt_mask_intensity;
     g_postprocess_config.color_grade = (ColorGradeMode)g_app_config.color_grade_mode;
+
+    // Sync Music Pack Config
+    g_music_pack_config.enabled = g_app_config.enable_music_pack;
+    strncpy(g_music_pack_config.pack_dir, g_app_config.music_pack_path, sizeof(g_music_pack_config.pack_dir) - 1);
+    g_music_pack_config.volume = g_app_config.music_volume;
+    g_music_pack_config.duck_percent = g_app_config.music_duck_percent;
+    g_music_pack_config.loop = g_app_config.music_loop;
 
     // Sync HD Pack Config
     g_hd_pack_config.enabled = g_app_config.enable_hd_pack;
@@ -1251,6 +1316,13 @@ static void save_runtime_preferences(void) {
     g_app_config.crt_mask_enabled = g_postprocess_config.crt_mask_enabled;
     g_app_config.crt_mask_intensity = g_postprocess_config.crt_mask_intensity;
     g_app_config.color_grade_mode = (int)g_postprocess_config.color_grade;
+
+    // Sync Music Pack Config
+    g_app_config.enable_music_pack = g_music_pack_config.enabled;
+    strncpy(g_app_config.music_pack_path, g_music_pack_config.pack_dir, sizeof(g_app_config.music_pack_path) - 1);
+    g_app_config.music_volume = g_music_pack_config.volume;
+    g_app_config.music_duck_percent = g_music_pack_config.duck_percent;
+    g_app_config.music_loop = g_music_pack_config.loop;
 
     // Sync HD Pack Config
     g_app_config.enable_hd_pack = g_hd_pack_config.enabled;
@@ -1751,6 +1823,30 @@ void gb_platform_set_dump_frames(const char* frames) {
     free(copy);
 }
 
+void gb_platform_set_composed_frames(const char* frames) {
+    if (!frames) return;
+    char* copy = strdup(frames);
+    char* token = strtok(copy, ",");
+    g_composed_frame_count = 0;
+    while (token && g_composed_frame_count < MAX_DUMP_FRAMES) {
+        g_composed_frames[g_composed_frame_count++] = (uint32_t)strtoul(token, NULL, 10);
+        token = strtok(NULL, ",");
+    }
+    free(copy);
+}
+
+void gb_platform_set_snapshot_frames(const char* frames) {
+    if (!frames) return;
+    char* copy = strdup(frames);
+    char* token = strtok(copy, ",");
+    g_snapshot_frame_count = 0;
+    while (token && g_snapshot_frame_count < MAX_DUMP_FRAMES) {
+        g_snapshot_frames[g_snapshot_frame_count++] = (uint32_t)strtoul(token, NULL, 10);
+        token = strtok(NULL, ",");
+    }
+    free(copy);
+}
+
 void gb_platform_set_dump_present_frames(const char* frames) {
     if (!frames) return;
     char* copy = strdup(frames);
@@ -2221,6 +2317,12 @@ static void render_frame_internal(const uint32_t* framebuffer, bool count_guest_
 
     if (count_guest_frame) {
         /* Handle Screenshot Dumping */
+        if (frame_is_selected_for_dump(g_snapshot_frames, g_snapshot_frame_count, (uint32_t)g_frame_count)) {
+            char frame_label[32];
+            snprintf(frame_label, sizeof(frame_label), "frame-%d", g_frame_count);
+            capture_guest_snapshot(frame_label);
+        }
+
         if (frame_is_selected_for_dump(g_dump_frames, g_dump_count, (uint32_t)g_frame_count)) {
             char suffix[32];
             snprintf(suffix, sizeof(suffix), "_%05d.ppm", g_frame_count);
@@ -2305,15 +2407,60 @@ static void render_frame_internal(const uint32_t* framebuffer, bool count_guest_
         cheats_apply_frame(g_registered_ctx);
     }
 
+    /*
+     * Follow the game's own music selection so replacement tracks change when
+     * the original score does. The id dips briefly between pieces, which would
+     * restart the replacement track from the top, so only act on a value that
+     * has held steady for a few frames. No-op unless the pack is enabled.
+     */
+    if (count_guest_frame && g_registered_ctx && g_music_pack_config.enabled) {
+        static int s_last_music_id = -1;
+        static int s_music_id_stable_frames = 0;
+        const int music_id = gb_state_music_track(g_registered_ctx);
+
+        if (music_id == s_last_music_id) {
+            if (s_music_id_stable_frames < MUSIC_ID_DEBOUNCE_FRAMES) {
+                s_music_id_stable_frames++;
+            }
+        } else {
+            s_last_music_id = music_id;
+            s_music_id_stable_frames = 0;
+        }
+
+        if (s_music_id_stable_frames == MUSIC_ID_DEBOUNCE_FRAMES) {
+            music_pack_request_track(music_id);
+        }
+    }
+
     /* Render widescreen or native frame */
     int render_w = GB_SCREEN_WIDTH;
     int render_h = GB_SCREEN_HEIGHT;
     if (g_app_config.widescreen_mode != ASPECT_NATIVE_10_9 && g_registered_ctx) {
-        widescreen_render_frame(g_registered_ctx, g_wide_framebuffer, &render_w, &render_h);
+        widescreen_render_frame(g_registered_ctx, framebuffer, g_wide_framebuffer, &render_w, &render_h);
         framebuffer = g_wide_framebuffer;
     }
 
     static uint32_t s_processed_framebuffer[GB_MAX_FRAMEBUFFER_SIZE];
+    static bool s_processed_valid = false;
+    static int s_processed_w = 0;
+    static int s_processed_h = 0;
+
+    /*
+     * Extra presents (smooth LCD transitions) repaint the *previous* completed
+     * guest frame - gb_platform_present_framebuffer discards the mid-frame
+     * slice and passes g_last_guest_framebuffer. The pixels are therefore
+     * identical, so recomposing them is not just wasted work, it actively
+     * corrupts the image: the widescreen re-render and the flashlight read the
+     * LCD registers live and see mid-frame raster state, and the film grain
+     * reseeds. Compose once per guest frame and repaint the cached result.
+     */
+    const bool recompose =
+        count_guest_frame || !s_processed_valid ||
+        s_processed_w != render_w || s_processed_h != render_h;
+
+    if (!recompose) {
+        goto upload_processed_frame;
+    }
 
     if (g_palette_idx == 0 || g_app_config.widescreen_mode != ASPECT_NATIVE_10_9) {
         memcpy(s_processed_framebuffer, framebuffer, render_w * render_h * sizeof(uint32_t));
@@ -2344,6 +2491,22 @@ static void render_frame_internal(const uint32_t* framebuffer, bool count_guest_
     /* 3. Apply Atmospheric Retro Horror Shaders (Vignette, Film Grain, Scanlines, CRT, Color Grade) */
     postprocess_apply(g_registered_ctx, s_processed_framebuffer, render_w, render_h);
 
+    s_processed_valid = true;
+    s_processed_w = render_w;
+    s_processed_h = render_h;
+
+    /* The composed frame - what is actually on screen - as opposed to the raw
+     * guest framebuffer that --dump-frames writes. */
+    if (count_guest_frame &&
+        frame_is_selected_for_dump(g_composed_frames, g_composed_frame_count,
+                                   (uint32_t)g_frame_count)) {
+        char suffix[48];
+        snprintf(suffix, sizeof(suffix), "_composed_%05d.ppm", g_frame_count);
+        const std::string filename = g_screenshot_prefix + suffix;
+        save_ppm(filename.c_str(), s_processed_framebuffer, render_w, render_h, g_frame_count);
+    }
+
+upload_processed_frame:
     if (!g_texture || g_texture_width != render_w || g_texture_height != render_h) {
         recreate_streaming_texture();
         update_game_viewport();
@@ -2663,6 +2826,55 @@ static void render_frame_internal(const uint32_t* framebuffer, bool count_guest_
                     g_app_config.enable_hd_portraits = g_hd_pack_config.enable_hd_portraits;
                     config_save_ini(NULL);
                 }
+
+                ImGui::Spacing();
+                ImGui::Separator();
+                ImGui::Spacing();
+                ImGui::TextWrapped("Replacement Soundtrack");
+                ImGui::TextWrapped(
+                    "Drop your own .ogg or .wav files into the music_pack folder to replace "
+                    "the in-game music. Name them track_0.ogg, track_1.ogg and so on to match "
+                    "the game's music tracks. No music ships with this project.");
+                ImGui::Spacing();
+
+                if (ImGui::Checkbox("Enable Music Pack", &g_music_pack_config.enabled)) {
+                    g_app_config.enable_music_pack = g_music_pack_config.enabled;
+                    if (!g_music_pack_config.enabled) {
+                        music_pack_request_track(MUSIC_PACK_NO_TRACK);
+                    }
+                    config_save_ini(NULL);
+                }
+                ImGui::Text("Folder: %s/", g_music_pack_config.pack_dir);
+                ImGui::Text("Tracks found: %d", g_music_pack_config.loaded_count);
+
+                if (ImGui::SliderInt("Music Volume", &g_music_pack_config.volume, 0, 100)) {
+                    g_app_config.music_volume = g_music_pack_config.volume;
+                    config_save_ini(NULL);
+                }
+                if (ImGui::SliderInt("Game Audio While Music Plays", &g_music_pack_config.duck_percent, 0, 100)) {
+                    g_app_config.music_duck_percent = g_music_pack_config.duck_percent;
+                    config_save_ini(NULL);
+                }
+                ImGui::TextWrapped(
+                    "Game Boy music and sound effects share the same channels, so the emulated "
+                    "audio is turned down rather than muted - lower this for less bleed-through, "
+                    "raise it to keep sound effects louder.");
+
+                if (ImGui::Checkbox("Loop Tracks", &g_music_pack_config.loop)) {
+                    g_app_config.music_loop = g_music_pack_config.loop;
+                    config_save_ini(NULL);
+                }
+                if (ImGui::Button("Reload Music Pack", ImVec2(280.0f * ui_scale, 36.0f * ui_scale))) {
+                    music_pack_reload();
+                }
+                if (music_pack_is_playing()) {
+                    ImGui::Text("Now playing: track id %d", music_pack_current_track());
+                } else {
+                    ImGui::Text("Now playing: (original soundtrack)");
+                }
+                for (int i = 0; i < music_pack_track_count(); i++) {
+                    ImGui::BulletText("%s (id %d)", music_pack_track_name(i), music_pack_track_id(i));
+                }
                 ImGui::Separator();
                 ImGui::Text("HD Texture Gallery (Loaded & Active):");
                 int tex_count = hd_pack_get_texture_count();
@@ -2806,7 +3018,7 @@ static void render_frame_internal(const uint32_t* framebuffer, bool count_guest_
             if (ImGui::BeginTabItem("Config & INI")) {
                 ImGui::BeginChild("TabScroll_Config", ImVec2(0.0f, -footer_height), false, ImGuiWindowFlags_AlwaysVerticalScrollbar);
                 ImGui::Spacing();
-                ImGui::Text("Active configuration file: config.ini");
+                ImGui::Text("Active configuration file: %s", config_get_default_path());
                 ImGui::Spacing();
                 if (ImGui::Button("Save Configuration to config.ini", ImVec2(280.0f * ui_scale, 36.0f * ui_scale))) {
                     config_save_ini(NULL);
@@ -2817,6 +3029,25 @@ static void render_frame_internal(const uint32_t* framebuffer, bool count_guest_
                 if (ImGui::Button("Reset All to Defaults", ImVec2(280.0f * ui_scale, 36.0f * ui_scale))) {
                     config_set_defaults(&g_app_config);
                     config_save_ini(NULL);
+                }
+
+                ImGui::Spacing();
+                ImGui::Separator();
+                ImGui::Spacing();
+                ImGui::TextWrapped("Diagnostics");
+                ImGui::TextWrapped(
+                    "Capture a snapshot of guest memory for debugging. Take one in each "
+                    "game state (walking around, shooting sequence, dialogue, main menu) "
+                    "and send the generated files so the correct game-state addresses can "
+                    "be identified.");
+                ImGui::Spacing();
+                if (ImGui::Button("Capture State Snapshot", ImVec2(280.0f * ui_scale, 36.0f * ui_scale))) {
+                    capture_guest_snapshot(NULL);
+                }
+                ImGui::Text("Snapshots captured this session: %d", state_dump_count());
+                ImGui::TextWrapped("Saved to: %s", state_dump_output_dir());
+                if (!g_snapshot_status.empty()) {
+                    ImGui::TextWrapped("%s", g_snapshot_status.c_str());
                 }
                 ImGui::EndChild();
                 ImGui::EndTabItem();
@@ -2934,6 +3165,7 @@ static void render_frame_internal(const uint32_t* framebuffer, bool count_guest_
 
 void gb_platform_shutdown(void) {
     hd_pack_shutdown();
+    music_pack_shutdown();
     close_input_record_file();
     close_audio_output_device();
     g_audio_output_devices.clear();
@@ -3054,6 +3286,7 @@ static bool current_audio_output_device_available(void) {
 
 static void close_audio_output_device(void) {
     if (g_audio_device) {
+        music_pack_set_audio_device(0);
         SDL_CloseAudioDevice(g_audio_device);
         g_audio_device = 0;
     }
@@ -3082,6 +3315,9 @@ static bool open_audio_output_device(const char* device_name, bool preserve_stat
 
     g_audio_device_sample_rate = (uint32_t)have.freq;
     g_audio_device_buffer_samples = (uint32_t)have.samples;
+    /* The mixer locks this device when swapping tracks so the audio callback
+     * never sees a half-replaced buffer. */
+    music_pack_set_audio_device(g_audio_device);
     g_audio_active_device_name = (device_name && device_name[0]) ? device_name : "System Default";
     recompute_audio_targets();
     reset_audio_output_buffer(preserve_stats);
@@ -3226,7 +3462,14 @@ static void sdl_audio_callback(void* userdata, Uint8* stream, int len) {
     int16_t* out = (int16_t*)stream;
     const uint32_t samples_needed = (uint32_t)(len / 4);
     const bool muted = g_audio_muted.load(std::memory_order_relaxed);
-    const uint32_t volume_percent = g_audio_volume_percent.load(std::memory_order_relaxed);
+    /*
+     * Game Boy music and SFX share the same four APU channels, so replacement
+     * music cannot mute "just the music". Instead the whole emulated APU is
+     * ducked while a replacement track is audible, leaving gunshots, doors and
+     * menu blips audible underneath it.
+     */
+    uint32_t volume_percent = g_audio_volume_percent.load(std::memory_order_relaxed);
+    volume_percent = (volume_percent * (uint32_t)music_pack_apu_level_percent()) / 100u;
     const uint32_t write_pos = g_audio_write_pos.load(std::memory_order_acquire);
     uint32_t read_pos = g_audio_read_pos.load(std::memory_order_relaxed);
     const uint32_t available = (write_pos >= read_pos)
@@ -3272,6 +3515,10 @@ static void sdl_audio_callback(void* userdata, Uint8* stream, int len) {
     }
 
     g_audio_read_pos.store(read_pos, std::memory_order_release);
+
+    if (!muted) {
+        music_pack_mix(out, (int)samples_needed);
+    }
 }
 
 static void publish_audio_write_batch(void) {
@@ -3444,6 +3691,7 @@ bool gb_platform_init(int scale) {
     lighting_init();
     postprocess_init();
     hd_pack_init(g_app_config.hd_pack_path);
+    music_pack_init(g_app_config.music_pack_path);
     fprintf(stderr, "[SDL] SDL initialized.\n");
 
 #if defined(__ANDROID__)
@@ -3793,6 +4041,12 @@ static bool handle_runtime_event(const SDL_Event* event, GBContext* ctx) {
                         const GBPortInputEvent port_event = {
                             GB_PORT_INPUT_TOGGLE_ENCOUNTERS, true};
                         gbrt_port_input(ctx, &port_event);
+                    }
+                    return true;
+
+                case SDL_SCANCODE_F4:
+                    if (pressed && event->key.repeat == 0) {
+                        capture_guest_snapshot(NULL);
                     }
                     return true;
 
@@ -4536,6 +4790,10 @@ void gb_platform_set_title(const char* title) {
 }
 
 void gb_platform_set_dump_frames(const char* frames) { (void)frames; }
+
+void gb_platform_set_snapshot_frames(const char* frames) { (void)frames; }
+
+void gb_platform_set_composed_frames(const char* frames) { (void)frames; }
 
 void gb_platform_set_screenshot_prefix(const char* prefix) { (void)prefix; }
 

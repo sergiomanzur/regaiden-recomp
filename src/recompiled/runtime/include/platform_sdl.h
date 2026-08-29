@@ -148,6 +148,19 @@ void gb_platform_set_input_record_file(const char* path);
 void gb_platform_set_dump_frames(const char* frames);
 
 /**
+ * @brief Capture a full guest memory snapshot on the given frames
+ *        (format: "frame1,frame2,..."). Used to locate real game-state
+ *        addresses by diffing states that are reachable without input.
+ */
+void gb_platform_set_snapshot_frames(const char* frames);
+
+/**
+ * @brief Dump the fully composed frame (widescreen fill, lighting, shaders)
+ *        on the given frames, rather than the raw guest framebuffer.
+ */
+void gb_platform_set_composed_frames(const char* frames);
+
+/**
  * @brief Dump every host present that occurs while one of the selected guest
  * frames is current (format: "frame1,frame2,...")
  */

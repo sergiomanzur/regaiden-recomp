@@ -30,6 +30,8 @@ add_library(main SHARED
     ${RECOMPILED_CHUNKS}
     ${RECOMPILED_FUNCS}
     ${RECOMPILED_DIR}/widescreen_ppu.c
+    ${RECOMPILED_DIR}/state_dump.c
+    ${RECOMPILED_DIR}/music_pack.c
     ${RECOMPILED_DIR}/lighting.c
     ${RECOMPILED_DIR}/postprocess.c
     ${RECOMPILED_DIR}/hd_pack.c

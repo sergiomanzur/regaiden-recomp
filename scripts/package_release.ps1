@@ -43,7 +43,9 @@ if (-not $SkipWindows) {
     Write-Host "[Windows] Packaging files..." -ForegroundColor Yellow
     Copy-Item "$WinBuildDir/src/recompiled/Resident_Evil_Gaiden__USA_.exe" $WinPkgDir -Force
     Copy-Item "$RootDir/deps/SDL2-2.30.12/lib/x64/SDL2.dll" $WinPkgDir -Force
-    Copy-Item "$RootDir/config.ini" $WinPkgDir -Force
+    # Ship the pristine defaults, never the developer's live config.ini
+    # (the running game rewrites that file with whatever is toggled on).
+    Copy-Item "$RootDir/config.default.ini" (Join-Path $WinPkgDir "config.ini") -Force
     Copy-Item "$RootDir/README.md" $WinPkgDir -Force
     Copy-Item "$RootDir/CHANGELOG.md" $WinPkgDir -Force
     Copy-Item "$RootDir/LICENSE" $WinPkgDir -Force

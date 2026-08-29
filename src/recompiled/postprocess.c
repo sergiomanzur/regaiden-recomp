@@ -3,16 +3,17 @@
 #include <stdlib.h>
 #include <string.h>
 
+// Opt-in enhancements: all off so the default presentation is untouched GBC output.
 PostProcessConfig g_postprocess_config = {
-    .vignette_enabled = true,
+    .vignette_enabled = false,
     .vignette_intensity = 45,
-    .film_grain_enabled = true,
+    .film_grain_enabled = false,
     .grain_intensity = 25,
-    .scanlines_enabled = true,
+    .scanlines_enabled = false,
     .scanline_intensity = 30,
     .crt_mask_enabled = false,
     .crt_mask_intensity = 20,
-    .color_grade = COLOR_GRADE_COLD_BIOHAZARD
+    .color_grade = COLOR_GRADE_OFF
 };
 
 #define VIG_LUT_MAX_W 336
