@@ -2,6 +2,18 @@
 
 All notable changes to **Resident Evil Gaiden Recompiled** will be documented in this file.
 
+## [v0.3.1] - 2026-08-29
+
+### Asset Packs on Android
+- **`hd_pack/` and `music_pack/` now work on Android.** Both resolved a bare relative path against the process working directory, which is neither writable nor reachable with a file manager on Android, so both packs were silently dead there. They now resolve into external app storage (`/sdcard/Android/data/com.capcom.regaiden/files/`), which a file manager, USB transfer or `adb push` can reach. Desktop behaviour is unchanged.
+
+### Documentation
+- **Added a "Making Your Own Asset Packs" guide** to the README covering HD texture and music pack layout, formats, naming, hot-reload, and how to get files onto an Android device. States plainly that the bundled `hd_pack/` is AI-generated placeholder art shipped only as a proof of concept and should be replaced.
+- **Corrected the control tables**, which did not match the actual default bindings: Quick Load is `F8` (not `F7`), the settings menu is `F10` (not `F1`, which is the performance overlay), the A/B secondary keys were swapped, Select's secondary is Right Shift (not Tab), Start has no secondary, and Fast Forward is Tab (not Space). The gamepad face buttons follow the Nintendo layout, so Game Boy `A` is the Xbox `B` button; Quick Save/Load are `X`/`Y`, not the bumpers.
+
+> Ships the same engine as v0.3.0; the Android asset-pack fix landed after those
+> binaries were built, so this release rebuilds both platforms.
+
 ## [v0.3.0] - 2026-08-29
 
 ### Rendering Fixes (Windows & Android)
@@ -21,13 +33,6 @@ All notable changes to **Resident Evil Gaiden Recompiled** will be documented in
 
 ### Diagnostics
 - **Added "Capture State Snapshot"** (menu -> Config & INI, or `F4` on desktop, plus a `--snapshot-frames` command-line option): writes a full dump of guest WRAM/HRAM/IO/OAM plus a readable register summary. Added to locate the game's real state addresses by diffing snapshots taken in different game states, since the flashlight gate, portrait selection and the built-in cheats were all built on addresses the disassembly does not corroborate.
-
-### Asset Packs on Android
-- **`hd_pack/` and `music_pack/` now work on Android.** Both resolved a bare relative path against the process working directory, which is neither writable nor reachable with a file manager on Android, so both packs were silently dead there. They now resolve into external app storage (`/sdcard/Android/data/com.capcom.regaiden/files/`), which a file manager, USB transfer or `adb push` can reach. Desktop behaviour is unchanged.
-
-### Documentation
-- **Added a "Making Your Own Asset Packs" guide** to the README covering HD texture and music pack layout, formats, naming, hot-reload, and how to get files onto an Android device. States plainly that the bundled `hd_pack/` is AI-generated placeholder art shipped only as a proof of concept and should be replaced.
-- **Corrected the control tables**, which did not match the actual default bindings: Quick Load is `F8` (not `F7`), the settings menu is `F10` (not `F1`, which is the performance overlay), the A/B secondary keys were swapped, Select's secondary is Right Shift (not Tab), Start has no secondary, and Fast Forward is Tab (not Space). The gamepad face buttons follow the Nintendo layout, so Game Boy `A` is the Xbox `B` button; Quick Save/Load are `X`/`Y`, not the bumpers.
 
 ### Replacement Soundtrack / Music Pack (Windows & Android)
 - **New `music_pack/` folder**, working the same way as `hd_pack/`: drop in `.ogg` or `.wav` files named `track_<id>` and they replace the in-game music. Nothing ships with the project - the files are user supplied, exactly like the ROM.

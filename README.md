@@ -3,7 +3,7 @@
 [![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Android%20(ARM64)%20%7C%20Linux%20(WIP)-blue.svg)]()
 [![C++](https://img.shields.io/badge/Language-C11%20%2F%20C%2B%2B20-orange.svg)]()
 [![Backend](https://img.shields.io/badge/Graphics-SDL2%20%7C%20Dear%20ImGui%20%7C%20GLES3-green.svg)]()
-[![Release](https://img.shields.io/badge/Release-v0.3.0-red.svg)]()
+[![Release](https://img.shields.io/badge/Release-v0.3.1-red.svg)]()
 [![License](https://img.shields.io/badge/License-MIT-purple.svg)]()
 
 A native static recompilation of **Resident Evil Gaiden** (Game Boy Color, 2001) for modern PC and Android platforms, built in C/C++ with hardware-accelerated SDL2, OpenGLES 3, and Dear ImGui.
@@ -72,8 +72,8 @@ Running directly on native hardware without CPU emulation overhead, this project
 
 ## Platform Availability & Roadmap
 
-- [x] **Windows (x86_64)**: Fully supported with static CRT, embedded icon, and release archive (**Release v0.3.0**).
-- [x] **Android (ARM64-v8a)**: Fully supported with touch gamepad, Retroid Pocket optimization, and legal ROM onboarding (**Release v0.3.0**).
+- [x] **Windows (x86_64)**: Fully supported with static CRT, embedded icon, and release archive (**Release v0.3.1**).
+- [x] **Android (ARM64-v8a)**: Fully supported with touch gamepad, Retroid Pocket optimization, and legal ROM onboarding (**Release v0.3.1**).
 - [ ] **Linux (x86_64 / ARM64)**: Native SDL2 + Vulkan build in active preparation.
 
 ---
