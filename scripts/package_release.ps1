@@ -52,6 +52,13 @@ if (-not $SkipWindows) {
     if (Test-Path "$RootDir/hd_pack") {
         Copy-Item -Recurse "$RootDir/hd_pack" $WinPkgDir -Force
     }
+    # Ship an empty music_pack with instructions so players know where their
+    # own soundtrack files go. No music is bundled.
+    $MusicDir = Join-Path $WinPkgDir "music_pack"
+    New-Item -ItemType Directory -Path $MusicDir -Force | Out-Null
+    if (Test-Path "$RootDir/dist/music_pack_README.txt") {
+        Copy-Item "$RootDir/dist/music_pack_README.txt" (Join-Path $MusicDir "README.txt") -Force
+    }
     
     $WinZip = Join-Path $ReleaseDir "Resident_Evil_Gaiden_Recomp_v${Version}_Windows.zip"
     if (Test-Path $WinZip) { Remove-Item -Force $WinZip }
@@ -76,7 +83,19 @@ if (-not $SkipAndroid) {
         $env:PATH = "$env:JAVA_HOME\bin;$env:PATH"
         Push-Location $AndroidDir
         try {
-            .\gradlew assembleDebug
+            # Gradle writes warnings (e.g. the SDK XML version notice) to stderr.
+            # Under $ErrorActionPreference = 'Stop', Windows PowerShell turns any
+            # native stderr line into a terminating NativeCommandError, which
+            # aborted the whole release on a harmless warning. Relax it here and
+            # check the real exit code instead.
+            $PreviousEap = $ErrorActionPreference
+            $ErrorActionPreference = 'Continue'
+            .\gradlew assembleDebug 2>&1 | ForEach-Object { Write-Host $_ }
+            $GradleExit = $LASTEXITCODE
+            $ErrorActionPreference = $PreviousEap
+            if ($GradleExit -ne 0) {
+                throw "Gradle build failed with exit code $GradleExit"
+            }
         } finally {
             Pop-Location
         }
