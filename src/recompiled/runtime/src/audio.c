@@ -839,39 +839,55 @@ static void audio_emit_sample(GBContext* ctx, GBAudio* apu) {
     int ch3_mix = 0;
     int ch4_mix = 0;
 
-    if (apu->ch1.enabled && (apu->ch1.nr12 & 0xF8)) {
-        int duty = (apu->ch1.nr11 >> 6) & 3;
-        int output = DUTY_CYCLES[duty][apu->ch1.wave_pos] ? 1 : -1;
-        ch1_mix = apu->ch1.volume * output;
+    if (apu->ch1.nr12 & 0xF8) {
+        uint8_t dac_code = 0;
+        if (apu->ch1.enabled) {
+            const int duty = (apu->ch1.nr11 >> 6) & 3;
+            if (DUTY_CYCLES[duty][apu->ch1.wave_pos]) {
+                dac_code = (uint8_t)(apu->ch1.volume & 0x0F);
+            }
+        }
+        ch1_mix = ((int)dac_code * 2) - 15;
         if (apu->nr51 & 0x01) right += ch1_mix;
         if (apu->nr51 & 0x10) left += ch1_mix;
     }
 
-    if (apu->ch2.enabled && (apu->ch2.nr22 & 0xF8)) {
-        int duty = (apu->ch2.nr21 >> 6) & 3;
-        int output = DUTY_CYCLES[duty][apu->ch2.wave_pos] ? 1 : -1;
-        ch2_mix = apu->ch2.volume * output;
+    if (apu->ch2.nr22 & 0xF8) {
+        uint8_t dac_code = 0;
+        if (apu->ch2.enabled) {
+            const int duty = (apu->ch2.nr21 >> 6) & 3;
+            if (DUTY_CYCLES[duty][apu->ch2.wave_pos]) {
+                dac_code = (uint8_t)(apu->ch2.volume & 0x0F);
+            }
+        }
+        ch2_mix = ((int)dac_code * 2) - 15;
         if (apu->nr51 & 0x02) right += ch2_mix;
         if (apu->nr51 & 0x20) left += ch2_mix;
     }
 
-    if (apu->ch3.enabled && (apu->ch3.nr30 & 0x80)) {
-        uint8_t byte = apu->ch3.wave_ram[apu->ch3.wave_pos / 2];
-        uint8_t sample = (apu->ch3.wave_pos & 1) ? (byte & 0x0F) : (byte >> 4);
-        switch ((apu->ch3.nr32 >> 5) & 3) {
-            case 0: sample = 8; break;
-            case 1: break;
-            case 2: sample >>= 1; break;
-            case 3: sample >>= 2; break;
+    if (apu->ch3.nr30 & 0x80) {
+        uint8_t dac_code = 0;
+        if (apu->ch3.enabled) {
+            const uint8_t byte = apu->ch3.wave_ram[apu->ch3.wave_pos / 2];
+            dac_code = (apu->ch3.wave_pos & 1) ? (byte & 0x0F) : (byte >> 4);
+            switch ((apu->ch3.nr32 >> 5) & 3) {
+                case 0: dac_code = 0; break;
+                case 1: break;
+                case 2: dac_code >>= 1; break;
+                case 3: dac_code >>= 2; break;
+            }
         }
-        ch3_mix = (int)sample - 8;
+        ch3_mix = (int)dac_code - 15;
         if (apu->nr51 & 0x04) right += ch3_mix;
         if (apu->nr51 & 0x40) left += ch3_mix;
     }
 
-    if (apu->ch4.enabled && (apu->ch4.nr42 & 0xF8)) {
-        int output = !(apu->ch4.lfsr & 1) ? 1 : -1;
-        ch4_mix = apu->ch4.volume * output;
+    if (apu->ch4.nr42 & 0xF8) {
+        uint8_t dac_code = 0;
+        if (apu->ch4.enabled && !(apu->ch4.lfsr & 1)) {
+            dac_code = (uint8_t)(apu->ch4.volume & 0x0F);
+        }
+        ch4_mix = ((int)dac_code * 2) - 15;
         if (apu->nr51 & 0x08) right += ch4_mix;
         if (apu->nr51 & 0x80) left += ch4_mix;
     }
