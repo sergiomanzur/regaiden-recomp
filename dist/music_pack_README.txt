@@ -61,5 +61,34 @@ original audio is turned down rather than muted while your music plays, so
 sound effects (gunshots, doors, menu blips) still come through. Adjust this
 with the "Game Audio While Music Plays" slider in the in-game menu.
 
+Seamless Loop Points:
+---------------------
+Custom tracks can loop seamlessly from a designated loop point (skipping the track's
+introductory part upon loop repetitions). Loop points can be defined in three ways:
+
+1. Embedded in WAV files (smpl chunk):
+   Standard sampler loop points exported from digital audio workstations (DAWs) such
+   as FL Studio, Reaper, Wavosaur, Audacity, GoldWave, etc., are detected automatically.
+
+2. Embedded in OGG Vorbis comment tags:
+   Add any of the following standard Vorbis comment tags using any audio tagger:
+   - LOOPSTART=<samples_or_seconds>  (e.g. 145200 or 3.292s or 00:03.292)
+   - LOOPEND=<samples_or_seconds>    (optional, defaults to end of track)
+   - LOOPLENGTH=<samples_or_seconds> (alternative to LOOPEND)
+   Tags with underscores (LOOP_START, LOOP_END, LOOP_LENGTH) are also recognized.
+
+3. External music_pack.ini (or track_<id>.ini):
+   Create a "music_pack.ini" text file inside this folder without needing any audio editor:
+
+   [track_10]
+   loop_start = 3.292s
+   loop_end = 85.5s
+
+   [track_1]
+   loop_start = 145200
+
+   Values can be specified in seconds (e.g. 3.5s, 01:15.5) or raw sample counts.
+   When loop points are active, the in-game menu (F10) displays the loop range!
+
 No music is included with this project. These files are yours to supply,
 exactly like the ROM.

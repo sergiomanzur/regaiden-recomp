@@ -36,6 +36,9 @@ int  music_pack_track_count(void);
 const char* music_pack_track_name(int index);
 /** @brief Track id parsed from the filename (track_07.ogg -> 7), or -1. */
 int  music_pack_track_id(int index);
+bool music_pack_track_has_loop(int index);
+uint32_t music_pack_track_loop_start(int index);
+uint32_t music_pack_track_loop_end(int index);
 
 /**
  * @brief Ask for the replacement track matching a guest music id.
@@ -48,6 +51,11 @@ void music_pack_request_track(int guest_track_id);
 
 int  music_pack_current_track(void);
 bool music_pack_is_playing(void);
+bool music_pack_current_has_loop(void);
+uint32_t music_pack_current_loop_start(void);
+uint32_t music_pack_current_loop_end(void);
+
+void music_pack_format_timestamp(uint32_t frames, char* buf, size_t buf_size);
 
 /**
  * @brief Return a descriptive name for known Resident Evil Gaiden music tracks,

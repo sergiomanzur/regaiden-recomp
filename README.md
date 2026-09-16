@@ -201,6 +201,23 @@ music_pack/
 | `26` | Corridor X (No Drums, Slower) |
 | `27` | Class Cabin (With Bass & Drums) |
 
+#### Seamless Loop Point Support
+
+Custom tracks can loop seamlessly from a designated loop point (skipping the song's intro on loop repetitions). Loop points can be configured in 3 flexible ways:
+
+1. **WAV Files (`smpl` Chunk)**: Standard sampler loop points embedded by digital audio workstations (DAWs) like FL Studio, Reaper, Wavosaur, Audacity, GoldWave, etc., are detected automatically.
+2. **OGG Vorbis Comments**: Standard comment tags like `LOOPSTART` (or `LOOP_START`) and `LOOPEND` / `LOOPLENGTH` (or `LOOP_END` / `LOOP_LENGTH`). Supports integer sample offsets, seconds (e.g. `3.292s`), or `MM:SS.mmm` timestamps.
+3. **External `music_pack.ini`**: Create a plain text `music_pack/music_pack.ini` file (or `track_<id>.ini`) to set loop points without needing an audio editor:
+   ```ini
+   [track_10]
+   loop_start = 3.292s
+   loop_end = 85.5s
+
+   [track_1]
+   loop_start = 145200
+   ```
+When loop points are present, the in-game menu (`F10`) displays the detected loop range (`[Loop: 00:03.29 -> 01:25.50]`).
+
 **Sound effects.** Game Boy music and SFX share the same four audio channels, so there is no way to mute only the music. The emulated audio is turned **down** instead, which keeps gunshots, doors and menu blips audible under your track. Two sliders control the balance:
 
 - **Music Volume** - how loud your replacement track is

@@ -45,6 +45,9 @@ typedef struct {
     char name[64];
     int  track_id;      /* parsed from the filename, -1 if absent */
     char path[512];
+    bool has_loop;
+    uint32_t loop_start; /* in 44.1 kHz stereo sample frames */
+    uint32_t loop_end;   /* in 44.1 kHz stereo sample frames (0 = full length) */
 } MusicTrackEntry;
 
 MusicPackConfig g_music_pack_config = {
@@ -66,6 +69,9 @@ static uint32_t s_pcm_frames = 0;
 static uint32_t s_pcm_pos = 0;
 static int  s_current_track = MUSIC_PACK_NO_TRACK;
 static int  s_fade_in_remaining = 0;
+static bool s_has_loop = false;
+static uint32_t s_loop_start = 0;
+static uint32_t s_loop_end = 0;
 
 static void lock_audio(void)   { if (s_audio_device) SDL_LockAudioDevice(s_audio_device); }
 static void unlock_audio(void) { if (s_audio_device) SDL_UnlockAudioDevice(s_audio_device); }
@@ -84,10 +90,43 @@ int music_pack_track_id(int index) {
     return (index >= 0 && index < s_track_count) ? s_tracks[index].track_id : -1;
 }
 
+bool music_pack_track_has_loop(int index) {
+    return (index >= 0 && index < s_track_count) ? s_tracks[index].has_loop : false;
+}
+
+uint32_t music_pack_track_loop_start(int index) {
+    return (index >= 0 && index < s_track_count) ? s_tracks[index].loop_start : 0;
+}
+
+uint32_t music_pack_track_loop_end(int index) {
+    return (index >= 0 && index < s_track_count) ? s_tracks[index].loop_end : 0;
+}
+
 int music_pack_current_track(void) { return s_current_track; }
 
 bool music_pack_is_playing(void) {
     return g_music_pack_config.enabled && s_pcm != NULL && s_pcm_frames > 0;
+}
+
+bool music_pack_current_has_loop(void) {
+    return s_has_loop;
+}
+
+uint32_t music_pack_current_loop_start(void) {
+    return s_loop_start;
+}
+
+uint32_t music_pack_current_loop_end(void) {
+    return s_loop_end;
+}
+
+void music_pack_format_timestamp(uint32_t frames, char* buf, size_t buf_size) {
+    if (!buf || buf_size == 0) return;
+    uint32_t total_sec = frames / MUSIC_SAMPLE_RATE;
+    uint32_t min = total_sec / 60;
+    uint32_t sec = total_sec % 60;
+    uint32_t ms = (uint32_t)(((uint64_t)(frames % MUSIC_SAMPLE_RATE) * 1000u) / MUSIC_SAMPLE_RATE);
+    snprintf(buf, buf_size, "%02u:%02u.%03u", min, sec, ms);
 }
 
 const char* music_pack_get_track_description(int track_id) {
@@ -253,6 +292,314 @@ static int parse_track_id(const char* filename) {
     return (int)strtol(p, NULL, 10);
 }
 
+/* ------------------------------------------------------------------ */
+/* Loop Point Detection (WAV smpl chunk, OGG Vorbis comment, and INI)  */
+/* ------------------------------------------------------------------ */
+
+static int str_case_prefix(const char* str, const char* prefix) {
+    while (*prefix) {
+        if (tolower((unsigned char)*str) != tolower((unsigned char)*prefix)) {
+            return 0;
+        }
+        str++;
+        prefix++;
+    }
+    return 1;
+}
+
+static int str_case_cmp(const char* s1, const char* s2) {
+    while (*s1 && *s2) {
+        int c1 = tolower((unsigned char)*s1);
+        int c2 = tolower((unsigned char)*s2);
+        if (c1 != c2) return c1 - c2;
+        s1++;
+        s2++;
+    }
+    return tolower((unsigned char)*s1) - tolower((unsigned char)*s2);
+}
+
+static uint32_t parse_loop_point_value(const char* str, int sample_rate) {
+    if (!str || !*str) return 0;
+    while (*str == ' ' || *str == '\t' || *str == '=' || *str == ':') str++;
+
+    /* Check for mm:ss or mm:ss.ms */
+    const char* colon = strchr(str, ':');
+    if (colon) {
+        double minutes = strtod(str, NULL);
+        double seconds = strtod(colon + 1, NULL);
+        double total_sec = minutes * 60.0 + seconds;
+        if (total_sec < 0) total_sec = 0;
+        return (uint32_t)(total_sec * MUSIC_SAMPLE_RATE);
+    }
+
+    /* Check for seconds with decimal or trailing 's' */
+    if (strchr(str, '.') != NULL || strchr(str, 's') != NULL || strchr(str, 'S') != NULL) {
+        double sec = strtod(str, NULL);
+        if (sec < 0) sec = 0;
+        return (uint32_t)(sec * MUSIC_SAMPLE_RATE);
+    }
+
+    /* Integer samples in source sample rate -> scale to 44.1 kHz */
+    long long samples = strtoll(str, NULL, 10);
+    if (samples <= 0) return 0;
+    if (sample_rate <= 0) sample_rate = MUSIC_SAMPLE_RATE;
+    double ratio = (double)MUSIC_SAMPLE_RATE / (double)sample_rate;
+    return (uint32_t)((double)samples * ratio);
+}
+
+static void parse_vorbis_comments(const stb_vorbis_comment* comment, int sample_rate,
+                                  uint32_t* out_loop_start, uint32_t* out_loop_end, bool* out_has_loop) {
+    if (!comment || !comment->comment_list) return;
+
+    bool has_start = false;
+    uint32_t start_val = 0;
+    uint32_t end_val = 0;
+    uint32_t length_val = 0;
+
+    for (int i = 0; i < comment->comment_list_length; i++) {
+        const char* c = comment->comment_list[i];
+        if (!c) continue;
+
+        if (str_case_prefix(c, "LOOPSTART=") || str_case_prefix(c, "LOOP_START=")) {
+            const char* val = strchr(c, '=') + 1;
+            start_val = parse_loop_point_value(val, sample_rate);
+            has_start = true;
+        } else if (str_case_prefix(c, "LOOPEND=") || str_case_prefix(c, "LOOP_END=")) {
+            const char* val = strchr(c, '=') + 1;
+            end_val = parse_loop_point_value(val, sample_rate);
+        } else if (str_case_prefix(c, "LOOPLENGTH=") || str_case_prefix(c, "LOOP_LENGTH=")) {
+            const char* val = strchr(c, '=') + 1;
+            length_val = parse_loop_point_value(val, sample_rate);
+        }
+    }
+
+    if (has_start) {
+        *out_has_loop = true;
+        *out_loop_start = start_val;
+        if (end_val > 0) {
+            *out_loop_end = end_val;
+        } else if (length_val > 0) {
+            *out_loop_end = start_val + length_val;
+        } else {
+            *out_loop_end = 0;
+        }
+    }
+}
+
+static bool read_ogg_loop_points(const char* path, uint32_t* out_loop_start, uint32_t* out_loop_end, bool* out_has_loop) {
+    SDL_RWops* rw = SDL_RWFromFile(path, "rb");
+    if (!rw) return false;
+    Sint64 size = SDL_RWsize(rw);
+    if (size <= 0 || size > 64 * 1024 * 1024) { SDL_RWclose(rw); return false; }
+
+    unsigned char* raw = (unsigned char*)malloc((size_t)size);
+    if (!raw) { SDL_RWclose(rw); return false; }
+    const size_t got = SDL_RWread(rw, raw, 1, (size_t)size);
+    SDL_RWclose(rw);
+    if (got != (size_t)size) { free(raw); return false; }
+
+    int err = 0;
+    stb_vorbis* v = stb_vorbis_open_memory(raw, (int)size, &err, NULL);
+    if (!v) { free(raw); return false; }
+
+    stb_vorbis_info info = stb_vorbis_get_info(v);
+    stb_vorbis_comment comment = stb_vorbis_get_comment(v);
+    parse_vorbis_comments(&comment, (int)info.sample_rate, out_loop_start, out_loop_end, out_has_loop);
+    stb_vorbis_close(v);
+    free(raw);
+    return *out_has_loop;
+}
+
+static bool read_wav_loop_points(const char* path, uint32_t* out_loop_start, uint32_t* out_loop_end, bool* out_has_loop) {
+    SDL_RWops* rw = SDL_RWFromFile(path, "rb");
+    if (!rw) return false;
+
+    uint8_t header[12];
+    if (SDL_RWread(rw, header, 1, 12) != 12) {
+        SDL_RWclose(rw);
+        return false;
+    }
+
+    if (memcmp(header, "RIFF", 4) != 0 || memcmp(header + 8, "WAVE", 4) != 0) {
+        SDL_RWclose(rw);
+        return false;
+    }
+
+    uint32_t sample_rate = 44100;
+    bool found_loop = false;
+
+    while (1) {
+        uint8_t chunk_hdr[8];
+        if (SDL_RWread(rw, chunk_hdr, 1, 8) != 8) break;
+
+        uint32_t chunk_size = (uint32_t)chunk_hdr[4] |
+                              ((uint32_t)chunk_hdr[5] << 8) |
+                              ((uint32_t)chunk_hdr[6] << 16) |
+                              ((uint32_t)chunk_hdr[7] << 24);
+
+        if (memcmp(chunk_hdr, "fmt ", 4) == 0 && chunk_size >= 16) {
+            uint8_t fmt_data[16];
+            if (SDL_RWread(rw, fmt_data, 1, 16) == 16) {
+                sample_rate = (uint32_t)fmt_data[4] |
+                              ((uint32_t)fmt_data[5] << 8) |
+                              ((uint32_t)fmt_data[6] << 16) |
+                              ((uint32_t)fmt_data[7] << 24);
+                if (sample_rate == 0) sample_rate = 44100;
+                if (chunk_size > 16) {
+                    SDL_RWseek(rw, (Sint64)(chunk_size - 16), RW_SEEK_CUR);
+                }
+            } else {
+                break;
+            }
+        } else if (memcmp(chunk_hdr, "smpl", 4) == 0 && chunk_size >= 36) {
+            uint8_t smpl_data[36];
+            if (SDL_RWread(rw, smpl_data, 1, 36) == 36) {
+                uint32_t num_loops = (uint32_t)smpl_data[28] |
+                                     ((uint32_t)smpl_data[29] << 8) |
+                                     ((uint32_t)smpl_data[30] << 16) |
+                                     ((uint32_t)smpl_data[31] << 24);
+                if (num_loops > 0 && chunk_size >= 36 + 24) {
+                    uint8_t loop_data[24];
+                    if (SDL_RWread(rw, loop_data, 1, 24) == 24) {
+                        uint32_t start_samp = (uint32_t)loop_data[8] |
+                                              ((uint32_t)loop_data[9] << 8) |
+                                              ((uint32_t)loop_data[10] << 16) |
+                                              ((uint32_t)loop_data[11] << 24);
+                        uint32_t end_samp = (uint32_t)loop_data[12] |
+                                            ((uint32_t)loop_data[13] << 8) |
+                                            ((uint32_t)loop_data[14] << 16) |
+                                            ((uint32_t)loop_data[15] << 24);
+                        double ratio = (double)MUSIC_SAMPLE_RATE / (double)sample_rate;
+                        *out_loop_start = (uint32_t)((double)start_samp * ratio);
+                        *out_loop_end = (uint32_t)((double)(end_samp + 1) * ratio);
+                        *out_has_loop = true;
+                        found_loop = true;
+                    }
+                }
+                uint32_t read_bytes = 36 + (num_loops > 0 && chunk_size >= 60 ? 24 : 0);
+                if (chunk_size > read_bytes) {
+                    SDL_RWseek(rw, (Sint64)(chunk_size - read_bytes), RW_SEEK_CUR);
+                }
+            } else {
+                break;
+            }
+        } else {
+            SDL_RWseek(rw, (Sint64)chunk_size, RW_SEEK_CUR);
+        }
+
+        if (chunk_size & 1) {
+            SDL_RWseek(rw, 1, RW_SEEK_CUR);
+        }
+    }
+
+    SDL_RWclose(rw);
+    return found_loop;
+}
+
+static bool read_ini_loop_points(const char* dir, const char* filename, int track_id,
+                                 uint32_t* out_loop_start, uint32_t* out_loop_end, bool* out_has_loop) {
+    char ini_path[512];
+    snprintf(ini_path, sizeof(ini_path), "%s/music_pack.ini", dir);
+
+    char section_target1[64] = {0};
+    char section_target2[64] = {0};
+    if (track_id >= 0) {
+        snprintf(section_target1, sizeof(section_target1), "[track_%d]", track_id);
+    }
+    if (filename && filename[0]) {
+        snprintf(section_target2, sizeof(section_target2), "[%s]", filename);
+    }
+
+    FILE* f = fopen(ini_path, "r");
+    if (!f && track_id >= 0) {
+        snprintf(ini_path, sizeof(ini_path), "%s/track_%d.ini", dir, track_id);
+        f = fopen(ini_path, "r");
+    }
+
+    if (!f) return false;
+
+    char line[256];
+    bool in_matching_section = (section_target1[0] == '\0' && section_target2[0] == '\0');
+    bool found = false;
+
+    while (fgets(line, sizeof(line), f)) {
+        char* p = line;
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p == ';' || *p == '#' || *p == '\0' || *p == '\r' || *p == '\n') continue;
+
+        if (*p == '[') {
+            in_matching_section = false;
+            char* end_bracket = strchr(p, ']');
+            if (end_bracket) {
+                *(end_bracket + 1) = '\0';
+                if ((section_target1[0] && str_case_cmp(p, section_target1) == 0) ||
+                    (section_target2[0] && str_case_cmp(p, section_target2) == 0)) {
+                    in_matching_section = true;
+                }
+            }
+            continue;
+        }
+
+        if (in_matching_section) {
+            char* eq = strchr(p, '=');
+            if (!eq) continue;
+            *eq = '\0';
+            char* key = p;
+            char* val = eq + 1;
+
+            char* kend = key + strlen(key) - 1;
+            while (kend >= key && (*kend == ' ' || *kend == '\t')) *kend-- = '\0';
+
+            while (*val == ' ' || *val == '\t') val++;
+            char* vend = val + strlen(val) - 1;
+            while (vend >= val && (*vend == ' ' || *vend == '\t' || *vend == '\r' || *vend == '\n')) *vend-- = '\0';
+
+            if (str_case_cmp(key, "loop_start") == 0 || str_case_cmp(key, "loopstart") == 0) {
+                *out_loop_start = parse_loop_point_value(val, MUSIC_SAMPLE_RATE);
+                *out_has_loop = true;
+                found = true;
+            } else if (str_case_cmp(key, "loop_end") == 0 || str_case_cmp(key, "loopend") == 0) {
+                *out_loop_end = parse_loop_point_value(val, MUSIC_SAMPLE_RATE);
+                found = true;
+            } else if (str_case_cmp(key, "loop_length") == 0 || str_case_cmp(key, "looplength") == 0) {
+                uint32_t len = parse_loop_point_value(val, MUSIC_SAMPLE_RATE);
+                *out_loop_end = *out_loop_start + len;
+                found = true;
+            }
+        }
+    }
+
+    fclose(f);
+    return found;
+}
+
+static void detect_track_loop_points(MusicTrackEntry* t, const char* dir) {
+    t->has_loop = false;
+    t->loop_start = 0;
+    t->loop_end = 0;
+
+    if (has_extension(t->name, ".ogg")) {
+        read_ogg_loop_points(t->path, &t->loop_start, &t->loop_end, &t->has_loop);
+    } else if (has_extension(t->name, ".wav")) {
+        read_wav_loop_points(t->path, &t->loop_start, &t->loop_end, &t->has_loop);
+    }
+
+    read_ini_loop_points(dir, t->name, t->track_id, &t->loop_start, &t->loop_end, &t->has_loop);
+
+    if (t->has_loop) {
+        char sbuf[32], ebuf[32];
+        music_pack_format_timestamp(t->loop_start, sbuf, sizeof(sbuf));
+        if (t->loop_end > 0) {
+            music_pack_format_timestamp(t->loop_end, ebuf, sizeof(ebuf));
+            printf("[Music Pack] Track '%s' loop points: %s -> %s (samples %u -> %u)\n",
+                   t->name, sbuf, ebuf, t->loop_start, t->loop_end);
+        } else {
+            printf("[Music Pack] Track '%s' loop point start: %s (sample %u)\n",
+                   t->name, sbuf, t->loop_start);
+        }
+    }
+}
+
 static void add_track(const char* dir, const char* filename) {
     if (s_track_count >= MUSIC_PACK_MAX_TRACKS) return;
     if (!has_extension(filename, ".ogg") && !has_extension(filename, ".wav")) return;
@@ -261,6 +608,7 @@ static void add_track(const char* dir, const char* filename) {
     snprintf(t->name, sizeof(t->name), "%s", filename);
     snprintf(t->path, sizeof(t->path), "%s/%s", dir, filename);
     t->track_id = parse_track_id(filename);
+    detect_track_loop_points(t, dir);
 }
 
 static void scan_directory(const char* dir) {
@@ -301,6 +649,9 @@ static void stop_playback_locked(void) {
     s_pcm_frames = 0;
     s_pcm_pos = 0;
     s_fade_in_remaining = 0;
+    s_has_loop = false;
+    s_loop_start = 0;
+    s_loop_end = 0;
 }
 
 void music_pack_init(const char* pack_dir) {
@@ -396,10 +747,23 @@ void music_pack_request_track(int guest_track_id) {
     s_pcm_pos = 0;
     s_current_track = guest_track_id;
     s_fade_in_remaining = FADE_FRAMES;
+    s_has_loop = s_tracks[entry].has_loop;
+    s_loop_start = s_tracks[entry].loop_start;
+    s_loop_end = (s_tracks[entry].loop_end > 0 && s_tracks[entry].loop_end <= frames)
+                 ? s_tracks[entry].loop_end : frames;
     unlock_audio();
 
-    printf("[Music Pack] Track %d -> %s (%.1fs)\n",
-           guest_track_id, s_tracks[entry].name, (double)frames / MUSIC_SAMPLE_RATE);
+    if (s_has_loop) {
+        char sbuf[32], ebuf[32];
+        music_pack_format_timestamp(s_loop_start, sbuf, sizeof(sbuf));
+        music_pack_format_timestamp(s_loop_end, ebuf, sizeof(ebuf));
+        printf("[Music Pack] Track %d -> %s (%.1fs, loop: %s -> %s)\n",
+               guest_track_id, s_tracks[entry].name, (double)frames / MUSIC_SAMPLE_RATE,
+               sbuf, ebuf);
+    } else {
+        printf("[Music Pack] Track %d -> %s (%.1fs)\n",
+               guest_track_id, s_tracks[entry].name, (double)frames / MUSIC_SAMPLE_RATE);
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -427,11 +791,13 @@ void music_pack_mix(int16_t* out, int frames) {
     if (volume == 0) return;
 
     for (int i = 0; i < frames; i++) {
-        if (s_pcm_pos >= s_pcm_frames) {
+        const uint32_t end_point = (s_has_loop && s_loop_end > 0 && s_loop_end <= s_pcm_frames)
+                                   ? s_loop_end : s_pcm_frames;
+        if (s_pcm_pos >= end_point) {
             if (!g_music_pack_config.loop) {
                 break;
             }
-            s_pcm_pos = 0;
+            s_pcm_pos = (s_has_loop && s_loop_start < end_point) ? s_loop_start : 0;
         }
 
         int gain = volume;

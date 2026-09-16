@@ -2975,10 +2975,29 @@ upload_processed_frame:
                 }
 
                 if (music_pack_is_playing()) {
-                    ImGui::TextColored(ImVec4(0.3f, 1.0f, 0.4f, 1.0f),
-                                       "Custom Music: Playing track_%d (%s)",
-                                       music_pack_current_track(),
-                                       music_pack_get_track_description(music_pack_current_track()));
+                    if (music_pack_current_has_loop()) {
+                        char start_buf[32], end_buf[32];
+                        music_pack_format_timestamp(music_pack_current_loop_start(), start_buf, sizeof(start_buf));
+                        if (music_pack_current_loop_end() > 0) {
+                            music_pack_format_timestamp(music_pack_current_loop_end(), end_buf, sizeof(end_buf));
+                            ImGui::TextColored(ImVec4(0.3f, 1.0f, 0.4f, 1.0f),
+                                               "Custom Music: Playing track_%d (%s) [Loop: %s -> %s]",
+                                               music_pack_current_track(),
+                                               music_pack_get_track_description(music_pack_current_track()),
+                                               start_buf, end_buf);
+                        } else {
+                            ImGui::TextColored(ImVec4(0.3f, 1.0f, 0.4f, 1.0f),
+                                               "Custom Music: Playing track_%d (%s) [Loop from: %s]",
+                                               music_pack_current_track(),
+                                               music_pack_get_track_description(music_pack_current_track()),
+                                               start_buf);
+                        }
+                    } else {
+                        ImGui::TextColored(ImVec4(0.3f, 1.0f, 0.4f, 1.0f),
+                                           "Custom Music: Playing track_%d (%s) [Full loop]",
+                                           music_pack_current_track(),
+                                           music_pack_get_track_description(music_pack_current_track()));
+                    }
                 } else if (g_music_pack_config.enabled) {
                     if (current_guest_track == 0) {
                         ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f),
@@ -3001,10 +3020,29 @@ upload_processed_frame:
                         ImGui::BulletText("%s (Ignored: Track 0 is silence; Title Screen is Track 10)",
                                           music_pack_track_name(i));
                     } else if (tid > 0) {
-                        ImGui::BulletText("%s -> Track %d (%s)",
-                                          music_pack_track_name(i),
-                                          tid,
-                                          music_pack_get_track_description(tid));
+                        if (music_pack_track_has_loop(i)) {
+                            char start_buf[32], end_buf[32];
+                            music_pack_format_timestamp(music_pack_track_loop_start(i), start_buf, sizeof(start_buf));
+                            if (music_pack_track_loop_end(i) > 0) {
+                                music_pack_format_timestamp(music_pack_track_loop_end(i), end_buf, sizeof(end_buf));
+                                ImGui::BulletText("%s -> Track %d (%s) [Loop: %s -> %s]",
+                                                  music_pack_track_name(i),
+                                                  tid,
+                                                  music_pack_get_track_description(tid),
+                                                  start_buf, end_buf);
+                            } else {
+                                ImGui::BulletText("%s -> Track %d (%s) [Loop from: %s]",
+                                                  music_pack_track_name(i),
+                                                  tid,
+                                                  music_pack_get_track_description(tid),
+                                                  start_buf);
+                            }
+                        } else {
+                            ImGui::BulletText("%s -> Track %d (%s)",
+                                              music_pack_track_name(i),
+                                              tid,
+                                              music_pack_get_track_description(tid));
+                        }
                     } else {
                         ImGui::BulletText("%s (Ignored: no track number found in name)",
                                           music_pack_track_name(i));
