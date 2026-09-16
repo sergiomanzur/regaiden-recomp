@@ -41,18 +41,13 @@ static inline bool gb_state_is_ui_screen(const GBContext* ctx) {
 /*
  * Current music track id.
  *
- * The sound driver keeps its state in $CE80-$CEFF (bank 1 holds the only
- * genuine APU code in the ROM, and every RAM address it touches falls in that
- * block). $CE8C is its current-song byte. Measured:
+ * The sound driver keeps its state in $CE80-$CEFF (bank 1 holds the APU code
+ * in the ROM). $CE8C is its current-song byte.
+ * 0 = silence / room transition / sound stop.
+ * 1..27 = music tracks (e.g. 1 = Battle, 10 = Title Screen).
  *
- *   93/93 snapshots roaming one area  -> 2
- *   75/75 snapshots, separate session -> 2
- *   title screen                      -> 8
- *   intro / attract sequence          -> 16 (11 earlier in the intro)
- *
- * Stable for as long as a piece of music is playing and changes exactly when
- * the music does, including holding steady when the inventory is opened over
- * the top of gameplay.
+ * Stable for as long as a piece of music is playing and changes when
+ * the music does, including holding steady when the inventory is opened.
  */
 static inline int gb_state_music_track(const GBContext* ctx) {
     if (!ctx || !ctx->wram) {

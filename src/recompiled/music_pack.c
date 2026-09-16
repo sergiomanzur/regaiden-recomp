@@ -90,6 +90,40 @@ bool music_pack_is_playing(void) {
     return g_music_pack_config.enabled && s_pcm != NULL && s_pcm_frames > 0;
 }
 
+const char* music_pack_get_track_description(int track_id) {
+    switch (track_id) {
+        case 0: return "Silence / Transition";
+        case 1: return "Battle";
+        case 2: return "Introduction (Part 1 - Capcom)";
+        case 3: return "Introduction (Part 2 - Virgin & M4)";
+        case 4: return "Introduction (Part 3 - In-game Cutscene)";
+        case 5: return "Restaurant";
+        case 6: return "Restaurant (Alternate Loop)";
+        case 7: return "Restaurant X";
+        case 8: return "Prologue / Cutscenes";
+        case 9: return "Unused / Silence";
+        case 10: return "Title Screen";
+        case 11: return "Side Deck";
+        case 12: return "Side Deck X";
+        case 13: return "Main Hall X (Variation)";
+        case 14: return "Side Deck X (Mild Drums)";
+        case 15: return "Main Hall";
+        case 16: return "Main Hall (Slower, No Bass)";
+        case 17: return "Main Hall X";
+        case 18: return "Title (Battle Version)";
+        case 19: return "Zombie Attack";
+        case 20: return "Class Cabin";
+        case 21: return "Class Cabin X";
+        case 22: return "Class Cabin (With Bass)";
+        case 23: return "Corridor";
+        case 24: return "Corridor X";
+        case 25: return "Corridor X (Variation)";
+        case 26: return "Corridor X (No Drums, Slower)";
+        case 27: return "Class Cabin (With Bass & Drums)";
+        default: return "Unknown";
+    }
+}
+
 /* ------------------------------------------------------------------ */
 /* Decoding                                                            */
 /* ------------------------------------------------------------------ */
@@ -325,10 +359,10 @@ void music_pack_request_track(int guest_track_id) {
         return; /* already on the right track */
     }
 
-    if (guest_track_id == MUSIC_PACK_NO_TRACK) {
+    if (guest_track_id <= 0 || guest_track_id == MUSIC_PACK_NO_TRACK) {
         lock_audio();
         stop_playback_locked();
-        s_current_track = MUSIC_PACK_NO_TRACK;
+        s_current_track = guest_track_id;
         unlock_audio();
         return;
     }

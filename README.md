@@ -149,21 +149,57 @@ Enable the pack with **Enable HD Texture Pack** in the menu. It is off by defaul
 
 ```
 music_pack/
-  track_2.ogg           <- replaces the game's music id 2
-  track_10.ogg          <- replaces music id 10
+  track_1.ogg           <- replaces Battle music (ID 1)
+  track_10.ogg          <- replaces Title Screen (ID 10)
   ...
 ```
 
 **Formats:** `.ogg` (Ogg Vorbis) and `.wav`. OGG is strongly preferred - a three-minute WAV is about 30 MB, which adds up fast, especially on a phone. Any sample rate and channel count works; files are converted to 44.1 kHz stereo when loaded.
 
-**Naming:** `track_<id>`, where `<id>` is the game's own music id. Tracks then follow the game automatically - the right music plays in the right place, and any id you have not supplied simply keeps the original Game Boy music. That means you can replace one track and leave the rest alone.
+**Naming:** `track_<id>`, where `<id>` is the game's own music ID (from 1 to 27). Tracks then follow the game automatically - the right music plays in the right place, and any ID you have not supplied simply keeps the original Game Boy music. That means you can replace one track and leave the rest alone.
 
-**Finding the id for a piece of music:**
+> [!NOTE]
+> **Track 0 is reserved for silence/stop**: During room transitions and scene fades, the sound driver sets the music register to 0 (silence). Do NOT name any music `track_0.ogg`, as it is not a playable track.
+
+**Finding or verifying track IDs:**
 
 1. Open the in-game menu (`F10` on desktop, the gear icon on Android)
-2. Enable **Enable Music Pack**
-3. Play until the music you want to replace is playing
-4. The menu shows **`Now playing: track id N`** - name your file `track_N.ogg`
+2. Go to the **HD Pack** tab
+3. The menu always displays **`Current Game Track: ID N (Name)`** regardless of whether a custom track is playing or not.
+4. Name your file `track_N.ogg` and click **Reload Music Pack** to test it immediately without restarting.
+
+#### Track ID Index
+
+| Track ID | Description / Scene |
+| :---: | :--- |
+| `0` | *Silence / Stop / Room Transitions* (Reserved - not a playable track) |
+| `1` | Battle |
+| `2` | Introduction (Part 1 - Capcom & Legal disclaimers) |
+| `3` | Introduction (Part 2 - Virgin Interactive & M4) |
+| `4` | Introduction (Part 3 - In-game Intro Cutscene) |
+| `5` | Restaurant |
+| `6` | Restaurant (Alternate Loop) |
+| `7` | Restaurant X |
+| `8` | Prologue / Cutscenes |
+| `9` | *Unused / Silence* |
+| `10` | **Title Screen** |
+| `11` | Side Deck |
+| `12` | Side Deck X |
+| `13` | Main Hall X (Variation) |
+| `14` | Side Deck X (Mild Drums) |
+| `15` | Main Hall |
+| `16` | Main Hall (Slower, No Bass) |
+| `17` | Main Hall X |
+| `18` | Title (Battle Version) |
+| `19` | Zombie Attack |
+| `20` | Class Cabin |
+| `21` | Class Cabin X |
+| `22` | Class Cabin (With Bass) |
+| `23` | Corridor |
+| `24` | Corridor X |
+| `25` | Corridor X (Variation) |
+| `26` | Corridor X (No Drums, Slower) |
+| `27` | Class Cabin (With Bass & Drums) |
 
 **Sound effects.** Game Boy music and SFX share the same four audio channels, so there is no way to mute only the music. The emulated audio is turned **down** instead, which keeps gunshots, doors and menu blips audible under your track. Two sliders control the balance:
 

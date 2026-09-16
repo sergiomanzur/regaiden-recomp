@@ -2929,8 +2929,9 @@ upload_processed_frame:
                 ImGui::TextWrapped("Replacement Soundtrack");
                 ImGui::TextWrapped(
                     "Drop your own .ogg or .wav files into the music_pack folder to replace "
-                    "the in-game music. Name them track_0.ogg, track_1.ogg and so on to match "
-                    "the game's music tracks. No music ships with this project.");
+                    "the in-game music. Name them track_1.ogg, track_10.ogg and so on to match "
+                    "the game's music tracks (Track 0 is reserved for silence/transitions). "
+                    "No music ships with this project.");
                 ImGui::Spacing();
 
                 if (ImGui::Checkbox("Enable Music Pack", &g_music_pack_config.enabled)) {
@@ -2963,13 +2964,51 @@ upload_processed_frame:
                 if (ImGui::Button("Reload Music Pack", ImVec2(280.0f * ui_scale, 36.0f * ui_scale))) {
                     music_pack_reload();
                 }
-                if (music_pack_is_playing()) {
-                    ImGui::Text("Now playing: track id %d", music_pack_current_track());
+
+                int current_guest_track = g_registered_ctx ? gb_state_music_track(g_registered_ctx) : -1;
+                if (current_guest_track >= 0) {
+                    ImGui::Text("Current Game Track: ID %d (%s)",
+                                current_guest_track,
+                                music_pack_get_track_description(current_guest_track));
                 } else {
-                    ImGui::Text("Now playing: (original soundtrack)");
+                    ImGui::Text("Current Game Track: None / Not loaded");
                 }
+
+                if (music_pack_is_playing()) {
+                    ImGui::TextColored(ImVec4(0.3f, 1.0f, 0.4f, 1.0f),
+                                       "Custom Music: Playing track_%d (%s)",
+                                       music_pack_current_track(),
+                                       music_pack_get_track_description(music_pack_current_track()));
+                } else if (g_music_pack_config.enabled) {
+                    if (current_guest_track == 0) {
+                        ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f),
+                                           "Custom Music: Silence / Transition");
+                    } else {
+                        ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.4f, 1.0f),
+                                           "Custom Music: None (playing original audio for ID %d)",
+                                           current_guest_track);
+                    }
+                } else {
+                    ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f),
+                                       "Custom Music: Disabled (playing original audio)");
+                }
+
+                ImGui::Spacing();
+                ImGui::Text("Loaded Custom Tracks (%d found):", music_pack_track_count());
                 for (int i = 0; i < music_pack_track_count(); i++) {
-                    ImGui::BulletText("%s (id %d)", music_pack_track_name(i), music_pack_track_id(i));
+                    int tid = music_pack_track_id(i);
+                    if (tid == 0) {
+                        ImGui::BulletText("%s (Ignored: Track 0 is silence; Title Screen is Track 10)",
+                                          music_pack_track_name(i));
+                    } else if (tid > 0) {
+                        ImGui::BulletText("%s -> Track %d (%s)",
+                                          music_pack_track_name(i),
+                                          tid,
+                                          music_pack_get_track_description(tid));
+                    } else {
+                        ImGui::BulletText("%s (Ignored: no track number found in name)",
+                                          music_pack_track_name(i));
+                    }
                 }
                 ImGui::Separator();
                 ImGui::Text("HD Texture Gallery (Loaded & Active):");

@@ -49,6 +49,12 @@ void music_pack_request_track(int guest_track_id);
 int  music_pack_current_track(void);
 bool music_pack_is_playing(void);
 
+/**
+ * @brief Return a descriptive name for known Resident Evil Gaiden music tracks,
+ *        or "Unknown" / "Silence / Transition".
+ */
+const char* music_pack_get_track_description(int track_id);
+
 /* --- audio thread --- */
 
 /**
