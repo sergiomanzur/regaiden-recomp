@@ -2,6 +2,23 @@
 
 All notable changes to **Resident Evil Gaiden Recompiled** will be documented in this file.
 
+## [v0.4.1] - 2026-09-16
+
+### Audio & Sound Enhancements (Windows & Android)
+- **Zombie Voices & PCM Audio Restored** ([#4](https://github.com/sergiomanzur/regaiden-recomp/issues/4)):
+  - Fixed an APU emulator issue where DAC conversion was bypassed when channel trigger/enable flags were inactive.
+  - The sound driver's direct DAC manipulation now always outputs proper bipolar AC audio levels (`((int)dac_code * 2) - 15`), fully restoring PCM digital voice samples, zombie growls, and sound effects (thanks @Rinnegatamante).
+- **Seamless Loop Point Support for Custom Audio** ([#5](https://github.com/sergiomanzur/regaiden-recomp/issues/5)):
+  - **WAV Files (`smpl` Chunk)**: Added automatic detection of standard sampler loop points exported from digital audio workstations (DAWs) like FL Studio, Reaper, Wavosaur, Audacity, and GoldWave.
+  - **OGG Vorbis Comments**: Supported standard loop comment tags (`LOOPSTART` / `LOOP_START`, `LOOPEND` / `LOOPLENGTH` / `LOOP_END` / `LOOP_LENGTH`) with sample frames, seconds (e.g. `3.292s`), or `MM:SS.mmm` timestamps.
+  - **External `music_pack.ini` Config**: Users can configure loop points in plain text via `music_pack/music_pack.ini` or companion `track_<id>.ini` files without needing audio editing software.
+  - **Seamless Mixer Looping**: Upon reaching `loop_end` (or track end), playback resumes smoothly from `loop_start`, preserving introductory sections while continuously looping the main theme.
+  - **In-Game Menu Loop Display**: The `F10` menu displays active loop ranges live for playing tracks and in the loaded track list (e.g. `[Loop: 00:03.292 -> 01:25.500]`).
+- **Music Pack Track ID Display & Track 0 Fix** ([#3](https://github.com/sergiomanzur/regaiden-recomp/issues/3)):
+  - The in-game settings menu (`F10`) now **always displays the active game track ID and descriptive title** (`Current Game Track: ID <N> (<Name>)`), even when running the original Game Boy soundtrack, making custom music creation simple.
+  - Handled **Track 0**: RE Gaiden's sound driver sets `$CE8C` to `0` during room transitions and sound stop routines. Custom playback is now cleanly stopped during Track 0 transitions, and any `track_0` files are warned as ignored in the UI to prevent conflicts with the Title Screen (Track 10).
+  - Added a complete **Track ID Index (Tracks 1 through 27)** across `README.md`, `dist/music_pack_README.txt`, and the in-game UI.
+
 ## [v0.4.0] - 2026-09-08
 
 ### Quality of Life & Gameplay Enhancements (Windows & Android)

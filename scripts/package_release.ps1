@@ -2,7 +2,7 @@
 # Packages Windows (.zip) and Android (.apk / .zip) independently for GitHub Releases.
 
 param(
-    [string]$Version = "0.4.0",
+    [string]$Version = "0.4.1",
     [switch]$SkipAndroid = $false,
     [switch]$SkipWindows = $false
 )
