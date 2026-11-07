@@ -24,6 +24,12 @@ include_directories(
 file(GLOB RECOMPILED_CHUNKS "${RECOMPILED_DIR}/Resident_Evil_Gaiden__USA__dispatch_chunk_*.c")
 file(GLOB RECOMPILED_FUNCS "${RECOMPILED_DIR}/Resident_Evil_Gaiden__USA__funcs_*.c")
 
+# The largest generated unit takes over ten minutes in the NDK's -O3 optimizer
+# alone. Use the desktop generated-code optimization level for this unit;
+# keep the existing Android optimization for the rest of the game and runtime.
+set_source_files_properties("${RECOMPILED_DIR}/Resident_Evil_Gaiden__USA__funcs_95.c"
+    PROPERTIES COMPILE_OPTIONS "-O1")
+
 add_library(main SHARED
     ${RECOMPILED_DIR}/Resident_Evil_Gaiden__USA__main.c
     ${RECOMPILED_DIR}/Resident_Evil_Gaiden__USA_.c
