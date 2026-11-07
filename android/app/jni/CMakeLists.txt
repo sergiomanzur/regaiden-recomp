@@ -80,3 +80,11 @@ target_link_libraries(main PRIVATE
     GLESv3
     OpenSLES
 )
+
+# Keep both JNI libraries loadable on Android devices with 16 KiB pages.
+# Gradle selects the static STL because NDK r26's shared STL is 4 KiB aligned.
+foreach(native_target IN ITEMS SDL2 main)
+    target_link_options(${native_target} PRIVATE
+        "-Wl,-z,max-page-size=16384"
+        "-Wl,-z,common-page-size=16384")
+endforeach()
