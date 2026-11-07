@@ -3,12 +3,12 @@
 [![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Android%20(ARM64)%20%7C%20Linux%20(WIP)-blue.svg)]()
 [![C++](https://img.shields.io/badge/Language-C11%20%2F%20C%2B%2B20-orange.svg)]()
 [![Backend](https://img.shields.io/badge/Graphics-SDL2%20%7C%20Dear%20ImGui%20%7C%20GLES3-green.svg)]()
-[![Release](https://img.shields.io/badge/Release-v0.4.1-red.svg)]()
+[![Release](https://img.shields.io/badge/Release-v0.4.2-red.svg)](https://github.com/sergiomanzur/regaiden-recomp/releases/latest)
 [![License](https://img.shields.io/badge/License-MIT-purple.svg)]()
 
 A native static recompilation of **Resident Evil Gaiden** (Game Boy Color, 2001) for modern PC and Android platforms, built in C/C++ with hardware-accelerated SDL2, OpenGLES 3, and Dear ImGui.
 
-Running directly on native hardware without CPU emulation overhead, this project modernizes the classic maritime survival horror experience with **Configurable Dash / Sprint**, **True Widescreen**, **Dynamic 2D Flashlight Lighting**, **Atmospheric Horror Shaders**, **Touch Controls**, a **Verified Cheats Engine**, and an **HD Texture Pack Engine**.
+Running directly on native hardware without CPU emulation overhead, this project modernizes the classic maritime survival horror experience with **Configurable Dash / Sprint**, **Widescreen**, **Dynamic 2D Flashlight Lighting**, **Atmospheric Horror Shaders**, **Touch Controls**, a **Verified Cheats Engine**, and an **HD Texture Pack Engine**.
 
 ---
 
@@ -30,10 +30,9 @@ Running directly on native hardware without CPU emulation overhead, this project
   - Speed slider adjustable from 125% to 250% in the new **Gameplay** settings tab.
 - **Combat & Menu Safety**: Automatically deactivates in battle (ROM Bank 13/14) and menus/inventory (`gb_state_is_ui_screen`), preserving 100% original combat meter timing, hit detection, and CD audio pitch.
 
-### 2. True Widescreen & Ultrawide Viewports (16:9 & 21:9)
-- **Eliminates Camera Crunch**: Expands the horizontal exploration viewport from 20 tiles (160px) to **32 tiles (256px - 16:9)** and **42 tiles (336px - 21:9)** directly in C.
-- **Corridor Sightlines**: Look deep down the narrow corridors of the luxury ocean liner *Starlight* to spot approaching zombies before bumping into them.
-- **Aspect Ratio Modes**: Toggle seamlessly between *Native 10:9 (160×144)*, *True Widescreen 16:9 (256×144)*, and *True Ultrawide 21:9 (336×144)* at runtime.
+### 2. Widescreen & Ultrawide Viewports (16:9 & 21:9)
+- **Aspect Ratio Modes**: Choose *Native 10:9 (160×144)*, *Widescreen 16:9 (256×144)*, or *Ultrawide 21:9 (336×144)* at runtime.
+- **Exploration Backgrounds**: The center keeps the original pixels. During scrolling, the sides can show nearby background tiles that have already passed through the viewport. Unseen areas and menus have black sides. Enemies and other moving objects remain within the original viewport.
 
 ### 3. Dynamic 2D Flashlight Lighting & 2D Horror Atmosphere
 - **Real-Time Directional Flashlight**: Barry's flashlight casts a real-time directional beam of light down dark ship hallways.
@@ -64,7 +63,7 @@ Running directly on native hardware without CPU emulation overhead, this project
 
 ### 6. Replacement Soundtrack (`music_pack/`)
 - **Bring Your Own Music**: Drop `.ogg` or `.wav` files into `music_pack/` to replace the in-game soundtrack.
-- **Follows the Game**: Tracks are matched to the game's own music ids, so the right music plays in the right place. Any id you have not supplied keeps the original music.
+- **Follows the Game**: Tracks match the game's music IDs. If the game switches to a variation you haven't supplied, a replacement already playing for that song can continue. Unrelated tracks without replacements use the original audio.
 - **Sound Effects Preserved**: Game Boy music and SFX share the same four channels, so the emulated audio is *ducked* rather than muted while your music plays - gunshots, doors and menu blips still come through.
 - **No music is bundled.** Like the ROM, the files are yours to supply.
 
@@ -92,8 +91,8 @@ Running directly on native hardware without CPU emulation overhead, this project
 
 ## Platform Availability & Roadmap
 
-- [x] **Windows (x86_64)**: Fully supported with static CRT, embedded icon, and release archive (**Release v0.4.1**).
-- [x] **Android (ARM64-v8a)**: Fully supported with touch gamepad, Retroid Pocket optimization, and legal ROM onboarding (**Release v0.4.1**).
+- [x] **Windows (x86_64)**: Fully supported with static CRT, embedded icon, and release archive.
+- [x] **Android (ARM64-v8a)**: Fully supported with touch gamepad, Retroid Pocket optimization, and ROM onboarding.
 - [ ] **Linux (x86_64 / ARM64)**: Native SDL2 + Vulkan build in active preparation.
 
 ---
@@ -143,6 +142,12 @@ hd_pack/
 
 Enable the pack with **Enable HD Texture Pack** in the menu. It is off by default.
 
+#### Exporting original graphics for reference
+
+Open **HD Pack & Mods** from `F10` or the Android gear menu and select **Dump Graphics to PNG**. Each capture saves all currently loaded tiles from both VRAM banks with every background and sprite palette, both tilemaps, and a native 160×144 frame. Sprite sheets use transparency for color index zero.
+
+The menu shows the output folder. On Android, it is normally `/sdcard/Android/data/com.capcom.regaiden/files/asset_dump/`. Each numbered capture has a manifest with image dimensions, tile layout, and filenames the HD pack accepts. Use the PNGs as source art for your replacements. The game loads graphics as you play, so capture the rooms, battles, and dialogue screens you want to cover.
+
 ---
 
 ### Replacement Soundtrack (`music_pack/`)
@@ -156,7 +161,7 @@ music_pack/
 
 **Formats:** `.ogg` (Ogg Vorbis) and `.wav`. OGG is strongly preferred - a three-minute WAV is about 30 MB, which adds up fast, especially on a phone. Any sample rate and channel count works; files are converted to 44.1 kHz stereo when loaded.
 
-**Naming:** `track_<id>`, where `<id>` is the game's own music ID (from 1 to 27). Tracks then follow the game automatically - the right music plays in the right place, and any ID you have not supplied simply keeps the original Game Boy music. That means you can replace one track and leave the rest alone.
+**Naming:** `track_<id>`, where `<id>` is the game's music ID (1 to 27). A supplied variation takes priority. If it is missing, an active replacement in the same variation group continues. A different song without a replacement falls back to Game Boy audio.
 
 > [!NOTE]
 > **Track 0 is reserved for silence/stop**: During room transitions and scene fades, the sound driver sets the music register to 0 (silence). Do NOT name any music `track_0.ogg`, as it is not a playable track.
@@ -298,10 +303,10 @@ After copying, either restart the game or use **Reload HD Textures** / **Reload 
 ## Building from Source
 
 ### Prerequisites
-- **CMake** (3.15 or newer)
+- **CMake** (3.20 or newer)
 - **C/C++ Compiler**: Clang, GCC, or MSVC (Visual Studio 2022) with C11 and C++20 support
 - **Ninja** or MSBuild
-- **SDL2 Development Libraries** (included in `deps/`)
+- **SDL2** (the build uses a suitable installed package or builds the vendored source)
 
 ### Build on Windows
 ```powershell
@@ -310,18 +315,22 @@ git clone https://github.com/sergiomanzur/regaiden-recomp.git
 cd regaiden-recomp
 
 # Build with static CRT and package Windows release
-.\scripts\package_release.ps1 -Version "0.4.0" -SkipAndroid
+.\scripts\package_release.ps1 -Version "0.4.2" -SkipAndroid
 ```
 
 ### Build on Android (APK)
+Set `JAVA_HOME` to a JDK 17 installation and `ANDROID_HOME` to an SDK with platform 34, NDK `26.2.11394342`, and CMake `3.22.1`.
+
 ```powershell
 # Navigate to Android directory
 cd android
 
 # Compile ARM64-v8a debug APK
-.\gradlew assembleDebug
+.\gradlew.bat :app:assembleDebug
 ```
 The resulting APK is generated at `android/app/build/outputs/apk/debug/app-debug.apk`.
+
+The desktop build includes ROM-free regression tests for widescreen, replacement music, and graphics exports. Run them with `ctest --test-dir build_release --output-on-failure` after building.
 
 ---
 

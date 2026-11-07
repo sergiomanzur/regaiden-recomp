@@ -35,7 +35,10 @@ int widescreen_get_target_width(void);
 int widescreen_get_target_height(void);
 
 /**
- * @brief Render the expanded True Widescreen or Native frame from Game Boy VRAM.
+ * @brief Render native pixels with a background extension from observed world tiles.
+ * Previously unseen scenery is black. The native viewport is always preserved.
+ * History is invalidated on detectable scene changes, UI, fades and camera jumps.
+ * This does not decode the room map or reconstruct offscreen actors.
  * @param ctx Game Boy context
  * @param native_fb Dot-accurate 160x144 frame from the PPU, copied verbatim into
  *                  the centre of the output. Pass NULL to sample the PPU directly.
@@ -45,6 +48,9 @@ int widescreen_get_target_height(void);
  */
 void widescreen_render_frame(GBContext* ctx, const uint32_t* native_fb, uint32_t* out_fb,
                              int* out_width, int* out_height);
+
+/** Clear observed scenery on game reset, ROM load, save-state load or mode change. */
+void widescreen_reset_history(void);
 
 #ifdef __cplusplus
 }

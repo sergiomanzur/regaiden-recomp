@@ -20,18 +20,17 @@ if ($Clean -and (Test-Path $BuildDir)) {
 
 Write-Host "[*] Configuring CMake with Clang..." -ForegroundColor Green
 cmake -G Ninja -B $BuildDir -DCMAKE_BUILD_TYPE=$BuildType -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
+if ($LASTEXITCODE -ne 0) { throw "CMake configuration failed ($LASTEXITCODE)" }
 
 Write-Host "[*] Compiling native binary..." -ForegroundColor Green
 ninja -C $BuildDir
+if ($LASTEXITCODE -ne 0) { throw "Build failed ($LASTEXITCODE)" }
 
 if (!(Test-Path "bin")) {
     New-Item -ItemType Directory -Force "bin" | Out-Null
 }
 
-if (Test-Path "deps/SDL2-2.30.12/lib/x64/SDL2.dll") {
-    Copy-Item "deps/SDL2-2.30.12/lib/x64/SDL2.dll" "$BuildDir/src/recompiled/" -Force
-    Copy-Item "deps/SDL2-2.30.12/lib/x64/SDL2.dll" "bin/" -Force
-}
+Copy-Item "$BuildDir/src/recompiled/SDL2.dll" "bin/" -Force
 
 if (Test-Path "$BuildDir/src/recompiled/Resident_Evil_Gaiden__USA_.exe") {
     Copy-Item "$BuildDir/src/recompiled/Resident_Evil_Gaiden__USA_.exe" "bin/" -Force

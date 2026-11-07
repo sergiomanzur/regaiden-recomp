@@ -2,7 +2,8 @@
 # Packages Windows (.zip) and Android (.apk / .zip) independently for GitHub Releases.
 
 param(
-    [string]$Version = "0.4.1",
+    [ValidatePattern('^\d+\.\d+\.\d+$')]
+    [string]$Version = "0.4.2",
     [switch]$SkipAndroid = $false,
     [switch]$SkipWindows = $false
 )
@@ -11,8 +12,29 @@ $ErrorActionPreference = "Stop"
 $RootDir = Split-Path -Parent $PSScriptRoot
 $ReleaseDir = Join-Path $RootDir "release"
 
+function Reset-PackageDirectory([string]$Path) {
+    $ReleaseRoot = [IO.Path]::GetFullPath($ReleaseDir).TrimEnd('\', '/')
+    $FullPath = [IO.Path]::GetFullPath($Path)
+    if ([IO.Path]::GetDirectoryName($FullPath) -ne $ReleaseRoot) {
+        throw "Invalid package directory: $FullPath"
+    }
+    if (Test-Path -LiteralPath $FullPath) {
+        $Entry = Get-Item -LiteralPath $FullPath -Force
+        if ($Entry.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+            throw "Package directory is a link: $FullPath"
+        }
+        $ResolvedParent = (Resolve-Path -LiteralPath $Entry.Parent.FullName).ProviderPath
+        if ($ResolvedParent -ne $ReleaseRoot) { throw "Invalid resolved package directory: $FullPath" }
+        Remove-Item -LiteralPath $FullPath -Recurse -Force
+    }
+    New-Item -ItemType Directory -Path $FullPath | Out-Null
+}
+
 if (-not (Test-Path $ReleaseDir)) {
     New-Item -ItemType Directory -Path $ReleaseDir | Out-Null
+}
+if ((Get-Item -LiteralPath $ReleaseDir -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) {
+    throw "Release output directory is a link: $ReleaseDir"
 }
 
 Write-Host "==================================================" -ForegroundColor Cyan
@@ -28,21 +50,25 @@ if (-not $SkipWindows) {
     
     cmake -B $WinBuildDir -G Ninja `
         -DCMAKE_BUILD_TYPE=Release `
+        -DBUILD_TESTING=ON `
         -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded `
         -DCMAKE_C_COMPILER=clang `
         -DCMAKE_CXX_COMPILER=clang++ `
         $RootDir
+    if ($LASTEXITCODE -ne 0) { throw "Windows CMake configuration failed ($LASTEXITCODE)" }
         
     Write-Host "[Windows] Compiling executable..." -ForegroundColor Yellow
-    ninja -C $WinBuildDir
+    cmake --build $WinBuildDir --parallel 8
+    if ($LASTEXITCODE -ne 0) { throw "Windows build failed ($LASTEXITCODE)" }
+    ctest --test-dir $WinBuildDir --output-on-failure --no-tests=error
+    if ($LASTEXITCODE -ne 0) { throw "Regression tests failed ($LASTEXITCODE)" }
     
     $WinPkgDir = Join-Path $ReleaseDir "Resident_Evil_Gaiden_Recomp_v${Version}_Windows"
-    if (Test-Path $WinPkgDir) { Remove-Item -Recurse -Force $WinPkgDir }
-    New-Item -ItemType Directory -Path $WinPkgDir | Out-Null
+    Reset-PackageDirectory $WinPkgDir
     
     Write-Host "[Windows] Packaging files..." -ForegroundColor Yellow
     Copy-Item "$WinBuildDir/src/recompiled/Resident_Evil_Gaiden__USA_.exe" $WinPkgDir -Force
-    Copy-Item "$RootDir/deps/SDL2-2.30.12/lib/x64/SDL2.dll" $WinPkgDir -Force
+    Copy-Item "$WinBuildDir/src/recompiled/SDL2.dll" $WinPkgDir -Force
     # Ship the pristine defaults, never the developer's live config.ini
     # (the running game rewrites that file with whatever is toggled on).
     Copy-Item "$RootDir/config.default.ini" (Join-Path $WinPkgDir "config.ini") -Force
@@ -75,12 +101,8 @@ if (-not $SkipAndroid) {
     $AndroidDir = Join-Path $RootDir "android"
     
     if (Test-Path $AndroidDir) {
-        if (Test-Path "C:\Program Files\JetBrains\PyCharm 2025.2.4\jbr") {
-            $env:JAVA_HOME = "C:\Program Files\JetBrains\PyCharm 2025.2.4\jbr"
-        } elseif (Test-Path "C:\Program Files\Android\Android Studio\jbr") {
-            $env:JAVA_HOME = "C:\Program Files\Android\Android Studio\jbr"
-        }
-        $env:PATH = "$env:JAVA_HOME\bin;$env:PATH"
+        # Honor the caller's JDK; newer Android Studio runtimes may be too new
+        # for the Gradle wrapper. See the README for the supported build setup.
         Push-Location $AndroidDir
         try {
             # Gradle writes warnings (e.g. the SDK XML version notice) to stderr.
@@ -90,7 +112,7 @@ if (-not $SkipAndroid) {
             # check the real exit code instead.
             $PreviousEap = $ErrorActionPreference
             $ErrorActionPreference = 'Continue'
-            .\gradlew assembleDebug 2>&1 | ForEach-Object { Write-Host $_ }
+            .\gradlew.bat :app:assembleDebug --console=plain 2>&1 | ForEach-Object { Write-Host $_ }
             $GradleExit = $LASTEXITCODE
             $ErrorActionPreference = $PreviousEap
             if ($GradleExit -ne 0) {
@@ -106,8 +128,7 @@ if (-not $SkipAndroid) {
             Copy-Item $BuiltApk $OutApk -Force
             
             $AndroidPkgDir = Join-Path $ReleaseDir "Resident_Evil_Gaiden_Recomp_v${Version}_Android"
-            if (Test-Path $AndroidPkgDir) { Remove-Item -Recurse -Force $AndroidPkgDir }
-            New-Item -ItemType Directory -Path $AndroidPkgDir | Out-Null
+            Reset-PackageDirectory $AndroidPkgDir
             Copy-Item $OutApk $AndroidPkgDir -Force
             Copy-Item "$RootDir/README.md" $AndroidPkgDir -Force
             Copy-Item "$RootDir/CHANGELOG.md" $AndroidPkgDir -Force
@@ -120,7 +141,7 @@ if (-not $SkipAndroid) {
             Write-Host "[Android] Successfully generated: $OutApk" -ForegroundColor Green
             Write-Host "[Android] Successfully generated: $AndroidZip" -ForegroundColor Green
         } else {
-            Write-Warning "[Android] APK not found at $BuiltApk"
+            throw "Android APK not found at $BuiltApk"
         }
     }
 }

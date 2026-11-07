@@ -45,6 +45,7 @@ typedef struct {
     char name[64];
     int  track_id;      /* parsed from the filename, -1 if absent */
     char path[512];
+    bool decode_failed; /* retry only after the pack is reloaded */
     bool has_loop;
     uint32_t loop_start; /* in 44.1 kHz stereo sample frames */
     uint32_t loop_end;   /* in 44.1 kHz stereo sample frames (0 = full length) */
@@ -67,6 +68,7 @@ static SDL_AudioDeviceID s_audio_device = 0;
 static int16_t* s_pcm = NULL;          /* interleaved stereo, 44100 Hz */
 static uint32_t s_pcm_frames = 0;
 static uint32_t s_pcm_pos = 0;
+static SDL_atomic_t s_finished;
 static int  s_current_track = MUSIC_PACK_NO_TRACK;
 static int  s_fade_in_remaining = 0;
 static bool s_has_loop = false;
@@ -105,7 +107,8 @@ uint32_t music_pack_track_loop_end(int index) {
 int music_pack_current_track(void) { return s_current_track; }
 
 bool music_pack_is_playing(void) {
-    return g_music_pack_config.enabled && s_pcm != NULL && s_pcm_frames > 0;
+    return g_music_pack_config.enabled && s_pcm != NULL && s_pcm_frames > 0 &&
+           (g_music_pack_config.loop || !SDL_AtomicGet(&s_finished));
 }
 
 bool music_pack_current_has_loop(void) {
@@ -608,6 +611,7 @@ static void add_track(const char* dir, const char* filename) {
     snprintf(t->name, sizeof(t->name), "%s", filename);
     snprintf(t->path, sizeof(t->path), "%s/%s", dir, filename);
     t->track_id = parse_track_id(filename);
+    t->decode_failed = false;
     detect_track_loop_points(t, dir);
 }
 
@@ -648,6 +652,7 @@ static void stop_playback_locked(void) {
     s_pcm = NULL;
     s_pcm_frames = 0;
     s_pcm_pos = 0;
+    SDL_AtomicSet(&s_finished, 0);
     s_fade_in_remaining = 0;
     s_has_loop = false;
     s_loop_start = 0;
@@ -695,14 +700,35 @@ static int find_entry_for_track(int guest_track_id) {
     return -1;
 }
 
+/* The guest compares the old and requested song IDs at 00:37cf–3816.
+ * Within any of these ranges it changes the arrangement through 01:402a
+ * instead of starting a new song through 01:4006. */
+static int song_family(int id) {
+    if (id >= 2 && id <= 7) return 2;
+    if (id >= 11 && id <= 17) return 11;
+    if (id >= 20 && id <= 27) return 20;
+    return 0;
+}
+
+static void stop_for_track(int track_id) {
+    if (track_id == s_current_track) return;
+    lock_audio();
+    stop_playback_locked();
+    s_current_track = track_id;
+    unlock_audio();
+}
+
+static void fallback_for_track(int guest_track_id) {
+    const int family = song_family(guest_track_id);
+    if (family != 0 && family == song_family(s_current_track) && music_pack_is_playing()) {
+        return; /* Preserve the replacement and its position across unmapped variations. */
+    }
+    stop_for_track(guest_track_id);
+}
+
 void music_pack_request_track(int guest_track_id) {
     if (!g_music_pack_config.enabled) {
-        if (s_pcm) {
-            lock_audio();
-            stop_playback_locked();
-            s_current_track = MUSIC_PACK_NO_TRACK;
-            unlock_audio();
-        }
+        stop_for_track(MUSIC_PACK_NO_TRACK);
         return;
     }
 
@@ -710,22 +736,14 @@ void music_pack_request_track(int guest_track_id) {
         return; /* already on the right track */
     }
 
-    if (guest_track_id <= 0 || guest_track_id == MUSIC_PACK_NO_TRACK) {
-        lock_audio();
-        stop_playback_locked();
-        s_current_track = guest_track_id;
-        unlock_audio();
+    if (guest_track_id <= 0) {
+        stop_for_track(guest_track_id);
         return;
     }
 
     const int entry = find_entry_for_track(guest_track_id);
-    if (entry < 0) {
-        /* No replacement supplied for this id: fall back to the original music
-         * rather than leaving the previous track running over the wrong scene. */
-        lock_audio();
-        stop_playback_locked();
-        s_current_track = guest_track_id;
-        unlock_audio();
+    if (entry < 0 || s_tracks[entry].decode_failed) {
+        fallback_for_track(guest_track_id);
         return;
     }
 
@@ -737,6 +755,8 @@ void music_pack_request_track(int guest_track_id) {
     if (!pcm || frames == 0) {
         free(pcm);
         printf("[Music Pack] Failed to decode '%s'\n", s_tracks[entry].path);
+        s_tracks[entry].decode_failed = true;
+        fallback_for_track(guest_track_id);
         return;
     }
 
@@ -790,11 +810,11 @@ void music_pack_mix(int16_t* out, int frames) {
     if (volume > 100) volume = 100;
     if (volume == 0) return;
 
+    const bool loop = g_music_pack_config.loop;
+    const uint32_t end_point = (loop && s_has_loop) ? s_loop_end : s_pcm_frames;
     for (int i = 0; i < frames; i++) {
-        const uint32_t end_point = (s_has_loop && s_loop_end > 0 && s_loop_end <= s_pcm_frames)
-                                   ? s_loop_end : s_pcm_frames;
         if (s_pcm_pos >= end_point) {
-            if (!g_music_pack_config.loop) {
+            if (!loop) {
                 break;
             }
             s_pcm_pos = (s_has_loop && s_loop_start < end_point) ? s_loop_start : 0;
@@ -815,4 +835,5 @@ void music_pack_mix(int16_t* out, int frames) {
         }
         s_pcm_pos++;
     }
+    SDL_AtomicSet(&s_finished, s_pcm_pos >= s_pcm_frames);
 }

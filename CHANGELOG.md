@@ -2,6 +2,13 @@
 
 All notable changes to **Resident Evil Gaiden Recompiled** will be documented in this file.
 
+## [v0.4.2] - 2026-11-06
+
+- Keep a replacement song playing when the game selects an unsupplied variation of that song. Supplied variations still take priority. ([#6](https://github.com/sergiomanzur/regaiden-recomp/issues/6))
+- Stop widescreen and ultrawide from repeating the Game Boy's circular background map. The sides use previously observed scenery; unseen areas stay black. ([#7](https://github.com/sergiomanzur/regaiden-recomp/issues/7))
+- Add **Dump Graphics to PNG** to **HD Pack & Mods**. Captures include loaded tiles, palettes, tilemaps, a native frame, and a texture pack naming guide. ([#8](https://github.com/sergiomanzur/regaiden-recomp/issues/8))
+- Restore clean-clone desktop builds without an embedded ROM or locally installed SDL import libraries. Run the regression suite before packaging a Windows release.
+
 ## [v0.4.1] - 2026-09-16
 
 ### Audio & Sound Enhancements (Windows & Android)

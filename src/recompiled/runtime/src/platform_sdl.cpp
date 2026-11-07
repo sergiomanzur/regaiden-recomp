@@ -45,6 +45,7 @@
 #include "postprocess.h"
 #include "hd_pack.h"
 #include "state_dump.h"
+#include "asset_dump.h"
 #include "music_pack.h"
 #include "game_state.h"
 
@@ -90,6 +91,8 @@ static bool g_smooth_lcd_transitions = true;
 static bool g_launcher_return_enabled = false;
 static bool g_benchmark_mode = false;
 static std::string g_persistence_dir;
+static std::string g_asset_dump_dir;
+static char g_asset_dump_status[768] = "";
 static GBPersistenceTestFault g_persistence_test_fault =
     GB_PERSISTENCE_TEST_FAULT_NONE;
 static GBPersistenceTestTarget g_persistence_test_target =
@@ -1084,6 +1087,7 @@ static void load_runtime_preferences(void) {
             std::error_code snapshot_ec;
             fs::create_directories(snapshot_dir, snapshot_ec);
             state_dump_set_output_dir(snapshot_dir.c_str());
+            g_asset_dump_dir = (fs::path(snapshot_dir).parent_path() / "asset_dump").string();
         }
     }
     g_render_scaling_mode = (GBRenderScalingMode)g_app_config.scaling_mode;
@@ -2528,13 +2532,9 @@ static void render_frame_internal(const uint32_t* framebuffer, bool count_guest_
         }
     }
 
-    /* Render widescreen or native frame */
-    int render_w = GB_SCREEN_WIDTH;
-    int render_h = GB_SCREEN_HEIGHT;
-    if (g_app_config.widescreen_mode != ASPECT_NATIVE_10_9 && g_registered_ctx) {
-        widescreen_render_frame(g_registered_ctx, framebuffer, g_wide_framebuffer, &render_w, &render_h);
-        framebuffer = g_wide_framebuffer;
-    }
+    const bool wide = g_registered_ctx && g_app_config.widescreen_mode != ASPECT_NATIVE_10_9;
+    const int render_w = wide ? widescreen_get_target_width() : GB_SCREEN_WIDTH;
+    const int render_h = GB_SCREEN_HEIGHT;
 
     static uint32_t s_processed_framebuffer[GB_MAX_FRAMEBUFFER_SIZE];
     static bool s_processed_valid = false;
@@ -2556,6 +2556,13 @@ static void render_frame_internal(const uint32_t* framebuffer, bool count_guest_
 
     if (!recompose) {
         goto upload_processed_frame;
+    }
+
+    if (wide) {
+        widescreen_render_frame(g_registered_ctx, framebuffer, g_wide_framebuffer, NULL, NULL);
+        framebuffer = g_wide_framebuffer;
+    } else {
+        widescreen_reset_history();
     }
 
     if (g_palette_idx == 0 || g_app_config.widescreen_mode != ASPECT_NATIVE_10_9) {
@@ -2612,9 +2619,13 @@ upload_processed_frame:
     double upload_start_ms = sdl_now_ms();
     void* pixels;
     int pitch;
-    SDL_LockTexture(g_texture, NULL, &pixels, &pitch);
-
-    memcpy(pixels, s_processed_framebuffer, render_w * render_h * sizeof(uint32_t));
+    if (!g_texture || SDL_LockTexture(g_texture, NULL, &pixels, &pitch) != 0) {
+        return;
+    }
+    for (int y = 0; y < render_h; ++y) {
+        memcpy(static_cast<uint8_t*>(pixels) + y * pitch,
+               s_processed_framebuffer + y * render_w, render_w * sizeof(uint32_t));
+    }
 
     SDL_UnlockTexture(g_texture);
     g_last_timing.upload_ms = sdl_now_ms() - upload_start_ms;
@@ -2689,6 +2700,7 @@ upload_processed_frame:
                             gb_context_load_rom(g_registered_ctx, g_rom_data, g_rom_size);
                             g_registered_ctx->mbc_type = g_rom_data[0x147];
                             gb_context_reset(g_registered_ctx, true);
+                            widescreen_reset_history();
                         }
                     }
                 }
@@ -2740,8 +2752,8 @@ upload_processed_frame:
                 ImGui::Spacing();
                 const char* aspect_names[] = {
                     "Native 10:9 (160x144)",
-                    "True Widescreen 16:9 (256x144 - 32x18 tiles)",
-                    "True Ultrawide 21:9 (336x144 - 42x18 tiles)"
+                    "Widescreen 16:9 (256x144)",
+                    "Ultrawide 21:9 (336x144)"
                 };
                 int current_wide = g_app_config.widescreen_mode;
                 if (ImGui::Combo("Display Mode", &current_wide, aspect_names, IM_ARRAYSIZE(aspect_names))) {
@@ -2750,7 +2762,8 @@ upload_processed_frame:
                     update_game_viewport();
                     config_save_ini(NULL);
                 }
-                ImGui::TextWrapped("True Widescreen expands the top-down exploration viewport from 160 to 256 pixels, eliminating camera crunch and allowing you to see enemies down ship corridors without stretching.");
+                ImGui::TextWrapped("Widescreen shows previously seen scenery alongside the original view. "
+                                   "Unseen areas and menus have black sides.");
                 const char* orientation_modes[] = {
                     "Auto (Sensor / Dynamic)",
                     "Lock to Landscape",
@@ -2908,6 +2921,19 @@ upload_processed_frame:
                 if (ImGui::Button("Reload HD Textures", ImVec2(240.0f * ui_scale, 32.0f * ui_scale))) {
                     hd_pack_reload(g_renderer);
                 }
+                ImGui::Spacing();
+                ImGui::Text("Texture Pack References:");
+                ImGui::BeginDisabled(!g_registered_ctx);
+                if (ImGui::Button("Dump Graphics to PNG", ImVec2(240.0f * ui_scale, 32.0f * ui_scale))) {
+                    asset_dump_capture(g_registered_ctx,
+                                       g_asset_dump_dir.empty() ? "asset_dump" : g_asset_dump_dir.c_str(),
+                                       g_asset_dump_status, sizeof(g_asset_dump_status));
+                }
+                ImGui::EndDisabled();
+                ImGui::TextWrapped("Export all currently loaded tiles, palettes, tilemaps and the native frame. "
+                                   "Visit other scenes and capture again to collect their graphics.");
+                ImGui::TextWrapped("Saved to: %s", g_asset_dump_dir.empty() ? "asset_dump" : g_asset_dump_dir.c_str());
+                if (g_asset_dump_status[0]) ImGui::TextWrapped("%s", g_asset_dump_status);
                 ImGui::Separator();
                 ImGui::TextDisabled("Active HD Replacements:");
                 if (ImGui::Checkbox("HD Pre-Rendered Backgrounds", &g_hd_pack_config.enable_hd_backgrounds)) {
@@ -4439,6 +4465,7 @@ void gb_platform_present_framebuffer(const uint32_t* framebuffer) {
 }
 
 void gb_platform_render_lcd_off_frame(void) {
+    widescreen_reset_history();
     ensure_lcd_off_framebuffer();
     const uint32_t* stable_framebuffer = g_last_guest_framebuffer_valid ? g_last_guest_framebuffer : g_lcd_off_framebuffer;
     render_frame_internal(stable_framebuffer, false);
@@ -4686,6 +4713,7 @@ static bool load_savestate_slot(GBContext* ctx, int slot) {
     sdl_get_savestate_path(filename, sizeof(filename), ctx, slot);
     const bool success = gb_context_load_state_file(ctx, filename);
     if (success) {
+        widescreen_reset_history();
         reset_audio_output_buffer(true);
         g_last_guest_framebuffer_valid = false;
         g_present_count = ctx->completed_frames;
@@ -4942,6 +4970,7 @@ static bool sdl_save_rtc_data(GBContext* ctx, const char* rom_name, const void* 
 }
 
 void gb_platform_register_context(GBContext* ctx) {
+    widescreen_reset_history();
     g_registered_ctx = ctx;
     GBPlatformCallbacks callbacks = {
         .on_audio_sample = on_audio_sample,

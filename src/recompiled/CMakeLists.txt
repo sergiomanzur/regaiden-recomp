@@ -56,7 +56,19 @@ endif()
 set(GBRT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/runtime")
 
 # Find SDL2
-find_package(SDL2 REQUIRED)
+if(NOT TARGET SDL2::SDL2)
+    find_package(SDL2 QUIET CONFIG)
+endif()
+if(NOT TARGET SDL2::SDL2)
+    # The checked-in development bundle omits .lib files. Build the vendored
+    # SDL source on a fresh clone rather than depending on local import libs.
+    set(SDL_TEST OFF CACHE BOOL "Build SDL tests" FORCE)
+    set(SDL_STATIC OFF CACHE BOOL "Build static SDL" FORCE)
+    set(SDL_SHARED ON CACHE BOOL "Build shared SDL" FORCE)
+    set(SDL_LIBC ON CACHE BOOL "Use system C library for SDL" FORCE)
+    add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/../../android/app/jni/SDL2"
+                     "${CMAKE_BINARY_DIR}/sdl2")
+endif()
 
 # Create runtime library with PPU and platform support
 add_library(gbrt STATIC
@@ -77,6 +89,7 @@ add_library(gbrt STATIC
     ${CMAKE_CURRENT_SOURCE_DIR}/cheats.c
     ${CMAKE_CURRENT_SOURCE_DIR}/widescreen_ppu.c
     ${CMAKE_CURRENT_SOURCE_DIR}/state_dump.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/asset_dump.c
     ${CMAKE_CURRENT_SOURCE_DIR}/music_pack.c
     ${CMAKE_CURRENT_SOURCE_DIR}/lighting.c
     ${CMAKE_CURRENT_SOURCE_DIR}/postprocess.c
@@ -418,7 +431,6 @@ add_executable(Resident_Evil_Gaiden__USA_
     Resident_Evil_Gaiden__USA__funcs_232.c
     Resident_Evil_Gaiden__USA__funcs_233.c
     Resident_Evil_Gaiden__USA__funcs_234.c
-    Resident_Evil_Gaiden__USA__rom.c
 )
 
 # Large generated translation units are memory-intensive. Keep runtime/UI
@@ -753,7 +765,7 @@ if(NOT CMAKE_BUILD_TYPE STREQUAL "Debug")
     endif()
 endif()
 
-if(NOT MSVC AND NOT CMAKE_BUILD_TYPE STREQUAL "Debug")
+if(NOT MSVC AND NOT CMAKE_C_SIMULATE_ID STREQUAL "MSVC" AND NOT CMAKE_BUILD_TYPE STREQUAL "Debug")
     if(APPLE)
         target_link_options(gbrt PRIVATE -Wl,-dead_strip)
         target_link_options(Resident_Evil_Gaiden__USA_ PRIVATE -Wl,-dead_strip)
@@ -774,6 +786,11 @@ if(GBRECOMP_ENABLE_IPO AND NOT CMAKE_BUILD_TYPE STREQUAL "Debug")
 endif()
 
 target_link_libraries(Resident_Evil_Gaiden__USA_ gbrt)
+if(WIN32)
+    add_custom_command(TARGET Resident_Evil_Gaiden__USA_ POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        $<TARGET_FILE:SDL2::SDL2> $<TARGET_FILE_DIR:Resident_Evil_Gaiden__USA_>)
+endif()
 if(TARGET SDL2::SDL2main)
     target_link_libraries(Resident_Evil_Gaiden__USA_ SDL2::SDL2main)
 elseif(TARGET SDL2main)

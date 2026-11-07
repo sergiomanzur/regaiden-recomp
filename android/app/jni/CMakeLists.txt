@@ -31,6 +31,7 @@ add_library(main SHARED
     ${RECOMPILED_FUNCS}
     ${RECOMPILED_DIR}/widescreen_ppu.c
     ${RECOMPILED_DIR}/state_dump.c
+    ${RECOMPILED_DIR}/asset_dump.c
     ${RECOMPILED_DIR}/music_pack.c
     ${RECOMPILED_DIR}/lighting.c
     ${RECOMPILED_DIR}/postprocess.c

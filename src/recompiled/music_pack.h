@@ -2,6 +2,7 @@
 #define RE_MUSIC_PACK_H
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -43,9 +44,9 @@ uint32_t music_pack_track_loop_end(int index);
 /**
  * @brief Ask for the replacement track matching a guest music id.
  *
- * Safe to call every frame; swapping only happens when the id actually
- * changes. Pass MUSIC_PACK_NO_TRACK to fade out and fall back to the
- * emulated soundtrack.
+ * Safe to call every frame. If the game switches to a variation without a
+ * usable replacement, an already playing replacement in the same song family
+ * continues. Pass MUSIC_PACK_NO_TRACK to stop and fall back to the APU.
  */
 void music_pack_request_track(int guest_track_id);
 

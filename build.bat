@@ -24,10 +24,7 @@ if %ERRORLEVEL% neq 0 (
 
 echo [*] Copying runtime dependencies...
 if not exist "bin" mkdir "bin"
-if exist "deps\SDL2-2.30.12\lib\x64\SDL2.dll" (
-    copy /Y "deps\SDL2-2.30.12\lib\x64\SDL2.dll" "%BUILD_DIR%\src\recompiled\" >nul
-    copy /Y "deps\SDL2-2.30.12\lib\x64\SDL2.dll" "bin\" >nul
-)
+copy /Y "%BUILD_DIR%\src\recompiled\SDL2.dll" "bin\" >nul || exit /b 1
 if exist "%BUILD_DIR%\src\recompiled\Resident_Evil_Gaiden__USA_.exe" (
     copy /Y "%BUILD_DIR%\src\recompiled\Resident_Evil_Gaiden__USA_.exe" "bin\" >nul
 )

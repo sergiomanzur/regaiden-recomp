@@ -49,3 +49,4 @@ config.ini
 
 # Local test staging directory
 testbuild/
+asset_dump/
